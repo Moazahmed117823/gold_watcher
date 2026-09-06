@@ -19,6 +19,13 @@ jobs:
   watch:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      # ============================================================
+      # 21K TARGET PRICE (EGP) - edit this one number whenever you like.
+      # You get a Telegram alert when the 21K gram price CROSSES this
+      # level (rises above it or falls below it). Set to 0 to disable.
+      # ============================================================
+      TARGET_21K: '6350'
 
     steps:
       - name: Check out repository
@@ -35,8 +42,15 @@ jobs:
 
       - name: Fetch gold prices
         env:
+          # Telegram (primary channel - see README Step 4 for 2-minute setup)
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Optional WhatsApp via Green API free tier (see README Step 4b):
+          # GREENAPI_INSTANCE_ID: ${{ secrets.GREENAPI_INSTANCE_ID }}
+          # GREENAPI_API_TOKEN: ${{ secrets.GREENAPI_API_TOKEN }}
+          # WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
+          # CallMeBot is currently full for new signups; kept for later:
+          # CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
         run: python scraper.py
 
       - name: Commit price history

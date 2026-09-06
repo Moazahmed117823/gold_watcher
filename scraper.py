@@ -10,14 +10,24 @@ Primary source : https://www.gold-price-today.com/egypt/
 Fallback source: api.gold-api.com (XAU/USD spot) + open.er-api.com (USD->EGP)
                  -> produces an *estimate* when the primary site is unreachable.
 
-Optional Telegram alert: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID as env
-vars (GitHub repo secrets) and the script sends a message ONLY when a price
-changes compared to the previous run.
+Telegram alert (primary channel): set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
+as env vars (GitHub repo secrets) - free, 2-minute setup via @BotFather.
+
+WhatsApp alerts (optional):
+  - Green API (free developer tier, recommended): set GREENAPI_INSTANCE_ID,
+    GREENAPI_API_TOKEN and WHATSAPP_PHONE. Link your WhatsApp by scanning a QR
+    code once at green-api.com.
+  - CallMeBot: also supported, but currently full for new signups.
+
+Target-price alerting: set TARGET_21K (env) or pass --target-21k N to get an
+alert whenever the 21K gram price CROSSES that fixed EGP level (up or down).
+0 (or unset) disables the target alert - prices are still recorded.
 
 Usage:
-    python scraper.py                 # normal run (record + notify on change)
-    python scraper.py --dry-run       # fetch and print, write nothing
-    python scraper.py --force-notify  # send a Telegram message even if unchanged
+    python scraper.py                    # normal run (record + target alert)
+    python scraper.py --dry-run          # fetch and print, write nothing
+    python scraper.py --target-21k 6350  # override TARGET_21K for this run
+    python scraper.py --force-notify     # send an alert even without a crossing
 """
 
 import argparse
@@ -60,6 +70,10 @@ HEADERS = {
     "Accept-Language": "ar,en;q=0.8",
 }
 
+WHATSAPP_PHONE = re.sub(r"\D", "", os.environ.get("WHATSAPP_PHONE", ""))  # digits only
+CALLMEBOT_APIKEY = os.environ.get("CALLMEBOT_APIKEY", "").strip()
+GREENAPI_INSTANCE_ID = os.environ.get("GREENAPI_INSTANCE_ID", "").strip()
+GREENAPI_API_TOKEN = os.environ.get("GREENAPI_API_TOKEN", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
@@ -213,58 +227,54 @@ def append_row(path, row):
 
 
 # --------------------------------------------------------------------------- #
-# Change detection + Telegram
+# Alert message + channels (Telegram primary, WhatsApp optional)
 # --------------------------------------------------------------------------- #
 TRACKED = ["gold_24k_sell", "gold_21k_sell", "gold_18k_sell", "gold_14k_sell", "gold_pound_coin"]
 
-
-def changes(prev_row, current):
-    """Return {field: (old, new)} for every tracked price that moved."""
-    if not prev_row:
-        return {}
-    out = {}
-    for field in TRACKED:
-        old, new = prev_row.get(field), current.get(field)
-        try:
-            if old is not None and new is not None and int(float(old)) != int(float(new)):
-                out[field] = (int(float(old)), int(float(new)))
-        except (TypeError, ValueError):
-            continue
-    return out
+FIELD_NAMES = {
+    "gold_24k_sell": "24K/gram", "gold_21k_sell": "21K/gram",
+    "gold_18k_sell": "18K/gram", "gold_14k_sell": "14K/gram",
+    "gold_pound_coin": "Gold pound",
+}
 
 
 def fmt(n):
     return f"{int(n):,}" if n not in (None, "") else "n/a"
 
 
-def build_message(current, diffs, prev_row):
-    names = {
-        "gold_24k_sell": "24K/gram", "gold_21k_sell": "21K/gram",
-        "gold_18k_sell": "18K/gram", "gold_14k_sell": "14K/gram",
-        "gold_pound_coin": "Gold pound",
-    }
+def build_message(current, target_hit, prev_row, target_21k):
+    """Compose the alert text. target_hit = 21K crossed the target price."""
     t = current["timestamp_cairo"]
-    lines = [f"Egypt Gold Price Update - {t}", f"Source: {current['source']}", ""]
+    head = "Egypt Gold Price Alert" if target_hit else "Egypt Gold Price Update"
+    lines = [f"{head} - {t}", f"Source: {current['source']}"]
+    if target_21k > 0:
+        lines.append(f"21K target: {target_21k:g} EGP")
+    lines.append("")
     for field in TRACKED:
         val = current.get(field)
         if val in (None, ""):
             continue
-        if field in diffs:
-            old, new = diffs[field]
-            arrow = "UP" if new > old else "DOWN"
-            lines.append(f"{names[field]}: {fmt(old)} -> {fmt(new)} EGP ({arrow})")
+        if field == "gold_21k_sell" and target_hit:
+            if target_hit.get("old") is not None:
+                lines.append(f"{FIELD_NAMES[field]}: {fmt(target_hit['old'])} -> "
+                             f"{fmt(target_hit['new'])} EGP "
+                             f"({target_hit['dir']} - crossed your target) [TRIGGERED]")
+            else:
+                lines.append(f"{FIELD_NAMES[field]}: {fmt(val)} EGP "
+                             "[already at/above your target]")
         else:
-            lines.append(f"{names[field]}: {fmt(val)} EGP")
-    if diffs:
+            lines.append(f"{FIELD_NAMES[field]}: {fmt(val)} EGP")
+    if target_hit:
         lines.append("")
-        lines.append("Prices changed since the last check.")
+        lines.append("21K crossed your target price - that is why you got this message.")
     elif prev_row:
         lines.append("")
-        lines.append("No change since the last check (forced notification).")
+        lines.append("No target crossing since the last check (forced notification).")
     return "\n".join(lines)
 
 
 def send_telegram(text):
+    """Primary channel - free and reliable. Bot via @BotFather."""
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         print("  [telegram] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set -> skipped")
         return False
@@ -277,6 +287,42 @@ def send_telegram(text):
     return True
 
 
+def send_whatsapp_greenapi(text):
+    """WhatsApp via Green API free developer tier (alternative to CallMeBot).
+    One-time setup: free account at green-api.com -> create an instance ->
+    scan the QR code with WhatsApp -> copy the instance id and API token."""
+    if not (GREENAPI_INSTANCE_ID and GREENAPI_API_TOKEN and WHATSAPP_PHONE):
+        print("  [whatsapp/green-api] GREENAPI_INSTANCE_ID / GREENAPI_API_TOKEN / "
+              "WHATSAPP_PHONE not set -> skipped")
+        return False
+    url = (f"https://api.green-api.com/waInstance{GREENAPI_INSTANCE_ID}"
+           f"/sendMessage/{GREENAPI_API_TOKEN}")
+    resp = requests.post(url, json={"chatId": f"{WHATSAPP_PHONE}@c.us",
+                                    "message": text}, timeout=20)
+    resp.raise_for_status()
+    print("  [whatsapp/green-api] message handed to Green API")
+    return True
+
+
+def send_whatsapp_callmebot(text):
+    """WhatsApp via CallMeBot - kept for when it reopens for new signups
+    (it is currently full). One-time setup at callmebot.com/whatsapp.php."""
+    if not (WHATSAPP_PHONE and CALLMEBOT_APIKEY):
+        print("  [whatsapp/callmebot] WHATSAPP_PHONE / CALLMEBOT_APIKEY not set -> skipped")
+        return False
+    resp = requests.get(
+        "https://api.callmebot.com/whatsapp.php",
+        params={"phone": WHATSAPP_PHONE, "text": text, "apikey": CALLMEBOT_APIKEY},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    snippet = resp.text[:150].strip()
+    if "error" in snippet.lower() or "invalid" in snippet.lower():
+        raise RuntimeError(f"CallMeBot replied with an error: {snippet}")
+    print("  [whatsapp/callmebot] message handed to CallMeBot")
+    return True
+
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -284,8 +330,20 @@ def main():
     parser = argparse.ArgumentParser(description="Egypt gold price watcher")
     parser.add_argument("--dry-run", action="store_true", help="do not write CSV")
     parser.add_argument("--force-notify", action="store_true",
-                        help="send Telegram alert even if nothing changed")
+                        help="send an alert even if nothing crossed the threshold")
+    parser.add_argument("--target-21k", type=float, default=None,
+                        help="alert when the 21K price crosses this fixed EGP level "
+                             "(overrides TARGET_21K env)")
     args = parser.parse_args()
+
+    raw_target = args.target_21k
+    if raw_target is None:
+        raw_target = os.environ.get("TARGET_21K", "")
+    try:
+        target_21k = float(raw_target) if str(raw_target).strip() else 0.0
+    except ValueError:
+        print(f"  [warn] invalid TARGET_21K={raw_target!r} -> target alert disabled")
+        target_21k = 0.0
 
     session = requests.Session()
 
@@ -296,32 +354,58 @@ def main():
     current = {"timestamp_utc": now_utc, "timestamp_cairo": now_cairo, **prices}
 
     prev_row = None if args.dry_run else read_last_row(CSV_PATH)
-    diffs = changes(prev_row, current)
+
+    # 21K target-price alert: fire when the 21K price crosses the target level.
+    target_hit = None
+    if target_21k > 0 and current.get("gold_21k_sell") is not None:
+        cur = float(current["gold_21k_sell"])
+        if prev_row is None:
+            if cur >= target_21k:
+                target_hit = {"old": None, "new": cur, "dir": "UP"}
+        else:
+            prev_val = prev_row.get("gold_21k_sell")
+            if prev_val not in (None, ""):
+                prev_val = float(prev_val)
+                if (prev_val < target_21k) != (cur < target_21k):
+                    target_hit = {"old": prev_val, "new": cur,
+                                  "dir": "UP" if cur > prev_val else "DOWN"}
 
     print("\n=== Egypt gold prices ===")
     print(f"  Time (Cairo) : {now_cairo}")
     print(f"  Source       : {current['source']}")
+    if target_21k > 0:
+        print(f"  21K target   : {target_21k:g} EGP")
     for field in TRACKED:
         if current.get(field) not in (None, ""):
             print(f"  {field:<16}: {fmt(current[field])} EGP")
-    print(f"  Changed fields: {len(diffs)}")
+    print(f"  Target crossed: {'yes (' + target_hit['dir'] + ')' if target_hit else 'no'}")
 
     if not args.dry_run:
         append_row(CSV_PATH, current)
         print(f"  Appended row to {CSV_PATH}")
 
-    should_notify = bool(diffs) or args.force_notify or prev_row is None
+    should_notify = bool(target_hit) or args.force_notify or prev_row is None
     if should_notify:
-        msg = build_message(current, diffs, prev_row)
-        print("\n--- Telegram message ---")
+        msg = build_message(current, target_hit, prev_row, target_21k)
+        print("\n--- Alert message ---")
         print(msg)
         if not args.dry_run:
-            try:
-                send_telegram(msg)
-            except Exception as err:  # noqa: BLE001 - never fail the run on notify
-                print(f"  [telegram] ERROR: {err}")
+            channels = []
+            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                channels.append(("telegram", send_telegram))
+            if GREENAPI_INSTANCE_ID and GREENAPI_API_TOKEN and WHATSAPP_PHONE:
+                channels.append(("whatsapp/green-api", send_whatsapp_greenapi))
+            if WHATSAPP_PHONE and CALLMEBOT_APIKEY:
+                channels.append(("whatsapp/callmebot", send_whatsapp_callmebot))
+            if not channels:
+                print("  [alerts] no messaging channel configured -> skipped")
+            for channel, sender in channels:
+                try:
+                    sender(msg)
+                except Exception as err:  # noqa: BLE001 - never fail the run on notify
+                    print(f"  [{channel}] ERROR: {err}")
     else:
-        print("  No price change -> no notification")
+        print("  21K did not cross the target -> no notification")
 
     if not current.get("gold_24k_sell"):
         print("FATAL: could not obtain any 24k price", file=sys.stderr)
