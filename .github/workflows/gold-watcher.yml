@@ -25,7 +25,7 @@ jobs:
       # You get a Telegram alert when the 21K gram price CROSSES this
       # level (rises above it or falls below it). Set to 0 to disable.
       # ============================================================
-      TARGET_21K: '6300'
+      TARGET_21K: '6450'
 
     steps:
       - name: Check out repository
