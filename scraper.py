@@ -355,21 +355,20 @@ def main():
 
     prev_row = None if args.dry_run else read_last_row(CSV_PATH)
 
-    # 21K target-price alert: fire when the 21K price crosses the target level.
+        # 21K target-price alert: fire EVERY run where the 21K price is at/above
+    # the target level (not only on the moment of crossing).
     target_hit = None
     if target_21k > 0 and current.get("gold_21k_sell") is not None:
         cur = float(current["gold_21k_sell"])
-        if prev_row is None:
-            if cur >= target_21k:
-                target_hit = {"old": None, "new": cur, "dir": "UP"}
+        prev_val = prev_row.get("gold_21k_sell") if prev_row else None
+        if prev_val in (None, ""):
+            prev_val = None
         else:
-            prev_val = prev_row.get("gold_21k_sell")
-            if prev_val not in (None, ""):
-                prev_val = float(prev_val)
-                if (prev_val < target_21k) != (cur < target_21k):
-                    target_hit = {"old": prev_val, "new": cur,
-                                  "dir": "UP" if cur > prev_val else "DOWN"}
-
+            prev_val = float(prev_val)
+        if cur >= target_21k:
+            target_hit = {"old": prev_val, "new": cur,
+                          "dir": "UP" if (prev_val is None or cur >= prev_val) else "DOWN"}
+          
     print("\n=== Egypt gold prices ===")
     print(f"  Time (Cairo) : {now_cairo}")
     print(f"  Source       : {current['source']}")
