@@ -126,3 +126,4 @@ python scraper.py --force-notify     # also test your Telegram bot
 | Telegram message never arrives | Message the bot once (press Start), re-check the token/chat-id secrets, and check `getUpdates` returns your chat id. |
 | CSV has duplicate timestamps | Two runs overlapped before `concurrency` was added, or you ran `workflow_dispatch` during a scheduled run. Harmless. |
 | Scheduled runs stopped | 60-day auto-disable (see above) — re-enable in the Actions tab. |
+## For hamada
