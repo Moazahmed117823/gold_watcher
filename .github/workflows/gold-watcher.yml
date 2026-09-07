@@ -1,11 +1,6 @@
 name: Egypt Gold Watcher
 
 on:
-  schedule:
-    # Every 30 minutes, in UTC.
-    # Cairo is UTC+2 (winter) / UTC+3 (summer) - a fixed 30-min interval
-    # is identical in both timezones, so no conversion needed.
-    - cron: '7,37 * * * *'
   workflow_dispatch:      # allows manual "Run workflow" button in the Actions tab
 
 permissions:
