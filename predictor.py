@@ -42,6 +42,7 @@ LEVELS_PATH = os.path.join(BASE_DIR, "data", "levels_history.csv")
 
 PRED_HEADER = ["timestamp_utc", "timestamp_cairo", "final_pct", "direction",
                "confidence", "technical", "consensus", "news", "price_21k",
+               "global_xauusd", "local_chg_7d", "global_chg_7d", "divergence_7d",
                "price_24h_later", "predicted_correct", "graded_at_utc"]
 LEVELS_HEADER = ["timestamp_utc", "price", "unit", "type", "title"]
 
@@ -88,6 +89,21 @@ def append_row(path, header, row):
         writer.writerow([row.get(col, "") for col in header])
 
 
+def migrate_pred_csv():
+    """Pad an older predictions.csv if the header gained columns (safe no-op)."""
+    if not os.path.exists(PRED_PATH):
+        return
+    with open(PRED_PATH, newline="", encoding="utf-8") as fh:
+        rows = [r for r in csv.reader(fh) if r]
+    if not rows or len(rows[0]) >= len(PRED_HEADER):
+        return
+    width = len(PRED_HEADER)
+    rows = ([rows[0] + PRED_HEADER[len(rows[0]):]] +
+            [r + [""] * (width - len(r)) for r in rows[1:]])
+    with open(PRED_PATH, "w", newline="", encoding="utf-8") as fh:
+        csv.writer(fh).writerows(rows)
+
+
 def fmt_sign(x):
     return f"{x:+.2f}"
 
@@ -107,7 +123,7 @@ def collect_signals():
     except Exception as err:  # noqa: BLE001
         print(f"  [gauge] consensus group failed: {err}", file=sys.stderr)
     try:
-        groups.append(news_reader.read_news())
+        groups.append(news_reader.read_news(max_articles=6))
     except Exception as err:  # noqa: BLE001
         print(f"  [gauge] news group failed: {err}", file=sys.stderr)
     return groups
@@ -314,6 +330,8 @@ def main():
             delta = None
 
     accuracy = None if args.dry_run else grade_pending()
+    if not args.dry_run:
+        migrate_pred_csv()
 
     # current 21K price for level distances
     current_21k = None
@@ -325,6 +343,21 @@ def main():
              f"Change: {('no data' if delta is None else f'{delta:+.0f} pts')} since last check"]
     for g in groups:
         lines.append(f"- {g['group']}: {fmt_sign(g['score'])} ({g['detail']})")
+
+    # Local-vs-global divergence: Egyptian prices = global gold x USD/EGP x
+    # local premium. A persistent spread means local market forces (merchant
+    # hoarding, supply, EGP moves) are dominating. Measured + logged first;
+    # it can earn a weight later once we have ~2 weeks of data.
+    tech_g = next((g for g in groups if g["group"] == "technical"), None)
+    cons_g = next((g for g in groups if g["group"] == "consensus"), None)
+    local_7d = (tech_g or {}).get("indicators", {}).get("mom_7d_pct")
+    global_7d = (cons_g or {}).get("perf_7d_pct")
+    global_close = (cons_g or {}).get("close")
+    divergence = None
+    if isinstance(local_7d, (int, float)) and isinstance(global_7d, (int, float)):
+        divergence = round(local_7d - global_7d, 3)
+        lines.append(f"- local-vs-global (7d): 21K {local_7d:+.2f}% | "
+                     f"XAU/USD {global_7d:+.2f}% | spread {divergence:+.2f} pts")
     if not args.dry_run:
         level_parts = summarize_levels(current_21k)
     else:
@@ -353,6 +386,10 @@ def main():
         "consensus": next((f"{g['score']:.3f}" for g in groups if g["group"] == "consensus"), ""),
         "news": next((f"{g['score']:.3f}" for g in groups if g["group"] == "news"), ""),
         "price_21k": current_21k if current_21k else "",
+        "global_xauusd": (f"{global_close:.2f}" if isinstance(global_close, (int, float)) else ""),
+        "local_chg_7d": (f"{local_7d:+.3f}" if isinstance(local_7d, (int, float)) else ""),
+        "global_chg_7d": (f"{global_7d:+.3f}" if isinstance(global_7d, (int, float)) else ""),
+        "divergence_7d": (f"{divergence:+.3f}" if divergence is not None else ""),
     })
     for g in groups:
         if g["group"] == "news":

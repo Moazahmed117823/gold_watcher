@@ -40,6 +40,10 @@ SYSTEM_PROMPT = (
     "- Only include levels whose NUMBERS literally appear in the text. If none, levels=[].\n"
     "- Choose the unit that matches the number's context in the text. When unsure, omit.\n"
     "- If the text is not about gold markets, or gives no direction: bias=neutral, confidence<=20.\n"
+    "- For EGYPTIAN local-market articles (Egypt, EGP prices, merchants, hoarding, "
+    "supply): local market dynamics and the parallel-market dollar can push local EGP "
+    "prices OPPOSITE to global gold. Report the direction the text argues for LOCAL "
+    "EGP prices, and include EGP/gram or EGP/coin levels whenever those numbers appear.\n"
     "- If unsure about anything, prefer neutral. Never invent numbers."
 )
 

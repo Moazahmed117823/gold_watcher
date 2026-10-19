@@ -33,8 +33,9 @@ YAHOO_GC_RSS = ("https://feeds.finance.yahoo.com/rss/2.0/headline?s=GC=F"
                 "&region=US&lang=en-US")     # gold futures: DIRECT article links
 GOOGLE_NEWS_EN = ("https://news.google.com/rss/search?q=gold+price+forecast+OR+"
                   "xauusd+OR+%22gold+rally%22&hl=en-US&gl=US&ceid=US:en")
-GOOGLE_NEWS_AR = ("https://news.google.com/rss/search?q=%D8%A3%D8%B3%D8%B9%D8%A7%D8%B1+"
-                  "%D8%A7%D9%84%D8%B0%D9%87%D8%A8&hl=ar&gl=EG&ceid=EG:ar")
+GOOGLE_NEWS_AR = ("https://news.google.com/rss/search?q=%D8%A3%D8%B3%D8%B9%D8%A7%D8%B1"
+                  "+%D8%A7%D9%84%D8%B0%D9%87%D8%A8+%D9%81%D9%8A+%D9%85%D8%B5%D8%B1"
+                  "&hl=ar&gl=EG&ceid=EG:ar")   # "أسعار الذهب في مصر" (Egypt focus)
 FOREXLIVE_RSS = "https://www.forexlive.com/feed/news"
 INVESTING_RSS = "https://www.investing.com/rss/news_11.rss"
 

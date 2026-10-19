@@ -20,7 +20,8 @@ import requests
 
 TV_URL = ("https://scanner.tradingview.com/symbol"
           "?symbol=OANDA%3AXAUUSD"
-          "&fields=Recommend.All%7C1,Recommend.MA%7C1,Recommend.Other%7C1"
+          "&fields=Recommend.All%7C1,Recommend.MA%7C1,Recommend.Other%7C1,"
+          "close%7C1,Perf.W,change%7C60"
           "&no_404=true")
 
 HEADERS = {
@@ -57,15 +58,24 @@ def fetch_consensus(timeout=15, retries=2):
             overall = data.get("Recommend.All|1")
             ma = data.get("Recommend.MA|1")
             osc = data.get("Recommend.Other|1")
+            close = data.get("close|1")          # global spot XAU/USD
+            perf_w = data.get("Perf.W")          # global 7-day % performance
+            chg60 = data.get("change|60")        # global 1h abs change (may be null)
             if overall is None:
                 raise ValueError(f"unexpected payload: {data}")
             overall = float(overall)
             detail = (f"TradingView XAU/USD: overall {overall:+.2f} ({_label(overall)}), "
                       f"MAs {float(ma):+.2f} ({_label(ma)}), "
                       f"oscillators {float(osc):+.2f} ({_label(osc)})")
+            if close is not None:
+                detail += f", spot {float(close):,.1f}"
+            if perf_w is not None:
+                detail += f", 7d {float(perf_w):+.2f}%"
             return {"group": "consensus", "score": round(max(-1.0, min(1.0, overall)), 3),
                     "weight": 1.0, "detail": detail,
-                    "raw": {"overall": overall, "ma": ma, "oscillators": osc}}
+                    "close": close, "perf_7d_pct": perf_w, "chg_1h": chg60,
+                    "raw": {"overall": overall, "ma": ma, "oscillators": osc,
+                            "close": close, "perf_w": perf_w, "chg60": chg60}}
         except Exception as err:  # noqa: BLE001
             last_err = err
             print(f"  [consensus] attempt {attempt}/{retries} failed: {err}",
