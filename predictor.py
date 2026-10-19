@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 import consensus
+import local_premium
 import news_reader
 import technical
 
@@ -43,10 +44,35 @@ LEVELS_PATH = os.path.join(BASE_DIR, "data", "levels_history.csv")
 PRED_HEADER = ["timestamp_utc", "timestamp_cairo", "final_pct", "direction",
                "confidence", "technical", "consensus", "news", "price_21k",
                "global_xauusd", "local_chg_7d", "global_chg_7d", "divergence_7d",
-               "price_24h_later", "predicted_correct", "graded_at_utc"]
+               "price_24h_later", "predicted_correct", "graded_at_utc",
+               "usdegp_official", "parallel_gap_pct", "real_premium_pct",
+               "formula_dev_pct"]
 LEVELS_HEADER = ["timestamp_utc", "price", "unit", "type", "title"]
 
-WEIGHTS = {"technical": 0.40, "consensus": 0.30, "news": 0.30}
+def _env_weight(name, default):
+    """Read a positive float weight from env; fall back to default on bad input."""
+    try:
+        v = float(os.environ.get(name, "").strip() or default)
+        return v if v > 0 else default
+    except ValueError:
+        return default
+
+
+# Weights are env-tunable so recalibration never needs a code change.
+# Weight study (2026-10, data: 2y GC=F + USDEGP + 43d real CSV, see
+# scripts/study_weights.py in the addon workspace): the source site COMPUTES
+# its 21K price as global ounce x parallel-market USD/EGP (verified mean
+# arithmetic error 0.005%), so the local series carries the parallel-dollar
+# information that global feeds cannot see. On days when local and global
+# signals disagree, local momentum predicted the next-day LOCAL move better
+# (2y disagreement subset 55-58% vs 47% for global-heavy; real 43d replay
+# 63% vs 41%, small n). Defaults below shift local from 40/30 to 50/20 while
+# keeping the global anchor; override via env vars without touching code.
+WEIGHTS = {
+    "technical": _env_weight("WEIGHT_TECHNICAL", 0.50),
+    "consensus": _env_weight("WEIGHT_CONSENSUS", 0.20),
+    "news": _env_weight("WEIGHT_NEWS", 0.30),
+}
 UP_THRESHOLD, DOWN_THRESHOLD = 58, 42          # % outside this band = directional
 NOTIFY_DELTA = 15.0                            # points vs previous run
 ACCURACY_WINDOW = 30                           # graded rows for the accuracy stat
@@ -339,8 +365,14 @@ def main():
         if g["group"] == "technical" and g.get("indicators", {}).get("column") == "gold_21k_sell":
             current_21k = g["indicators"].get("last")
 
+    if delta is not None:
+        change_txt = f"{delta:+.0f} pts since last check"
+    elif args.dry_run:
+        change_txt = "n/a (dry run)"
+    else:
+        change_txt = "first logged run - baseline saved"
     lines = [f"Gold gauge: {pct}% {direction} ({conf})",
-             f"Change: {('no data' if delta is None else f'{delta:+.0f} pts')} since last check"]
+             f"Change: {change_txt}"]
     for g in groups:
         lines.append(f"- {g['group']}: {fmt_sign(g['score'])} ({g['detail']})")
 
@@ -358,10 +390,20 @@ def main():
         divergence = round(local_7d - global_7d, 3)
         lines.append(f"- local-vs-global (7d): 21K {local_7d:+.2f}% | "
                      f"XAU/USD {global_7d:+.2f}% | spread {divergence:+.2f} pts")
-    if not args.dry_run:
-        level_parts = summarize_levels(current_21k)
-    else:
-        level_parts = []
+
+    # Local premium monitor: the source site bakes parallel-dollar stress,
+    # making charges and scarcity premiums into its USD/EGP rate - invisible
+    # inside its own numbers. Measure the invisible against external
+    # references: official-FX gap, your real souq reports, formula-break
+    # alarm. Fail-soft: any problem here never blocks the gauge.
+    prem = None
+    try:
+        prem = local_premium.measure(CSV_PATH, PRED_PATH)
+    except Exception as err:  # noqa: BLE001
+        print(f"  [premium] monitor failed: {err}", file=sys.stderr)
+    if prem:
+        lines.extend(prem["lines"])
+    level_parts = summarize_levels(current_21k)  # read-only, safe in dry-run too
     if level_parts:
         lines.append("Levels (7d): " + " | ".join(level_parts))
     if accuracy:
@@ -390,6 +432,14 @@ def main():
         "local_chg_7d": (f"{local_7d:+.3f}" if isinstance(local_7d, (int, float)) else ""),
         "global_chg_7d": (f"{global_7d:+.3f}" if isinstance(global_7d, (int, float)) else ""),
         "divergence_7d": (f"{divergence:+.3f}" if divergence is not None else ""),
+        "usdegp_official": (f"{prem['official']:.4f}"
+                            if prem and prem.get("official") else ""),
+        "parallel_gap_pct": (f"{prem['gap_pct']:+.3f}"
+                             if prem and prem.get("gap_pct") is not None else ""),
+        "real_premium_pct": (f"{prem['real_premium_pct']:+.3f}"
+                             if prem and prem.get("real_premium_pct") is not None else ""),
+        "formula_dev_pct": (f"{prem['formula_dev_pct']:+.3f}"
+                            if prem and prem.get("formula_dev_pct") is not None else ""),
     })
     for g in groups:
         if g["group"] == "news":
