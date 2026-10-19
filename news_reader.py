@@ -45,9 +45,10 @@ RSS_FEEDS = [("yahoo-gold-futures", YAHOO_GC_RSS),
              ("forexlive", FOREXLIVE_RSS),
              ("investing-commodities", INVESTING_RSS)]
 
-# news.google.com links are JS redirect wrappers -> fetching them returns an
-# 11-char page ("Google News"). Treat these feeds as headline-only sources.
-WRAPPER_FEEDS = ("google-news",)
+# Feeds whose links never yield a fetchable article body (news.google.com
+# links are JS redirect wrappers; investing.com returns 403). Their RSS text
+# is used as-is, so no request is wasted and no 403 noise appears.
+WRAPPER_FEEDS = ("google-news", "investing")
 
 GOLD_KEYWORDS = re.compile(
     r"gold|xau|bullion|fed|dollar|([\u0600-\u06FF]*\u0630\u0647\u0628)", re.IGNORECASE)
@@ -109,7 +110,7 @@ def collect_headlines(max_per_feed=12):
     return out
 
 
-def fetch_article_text(url, timeout=15, max_chars=4000):
+def fetch_article_text(url, timeout=15, max_chars=3000):
     """Fetch an article page and return readable text (BeautifulSoup).
 
     Prefers <p> paragraphs (skips nav menus, icon-font glyph walls and

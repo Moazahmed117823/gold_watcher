@@ -10,8 +10,11 @@ Configured entirely via environment variables:
                        https://api.z.ai/api/paas/v4           (Z.ai GLM, free tier)
                        https://openrouter.ai/api/v1           (OpenRouter)
     LLM_API_KEY    the secret (repo secret LLM_API_KEY)
-    LLM_MODEL      e.g. llama-3.1-8b-instant / qwen3-32b / glm-4.7-flash
+    LLM_MODEL      e.g. openai/gpt-oss-20b / llama-3.3-70b-versatile / glm-4.7-flash
     LLM_TIMEOUT    optional, seconds (default 25)
+    LLM_MIN_INTERVAL  optional, min seconds between requests (default 10).
+                      Groq free tier allows only 8,000 tokens/MINUTE and one
+                      article costs ~1.3k tokens -> calls must be spaced out.
 
 If any variable is missing, or the openai package is not installed, the
 adapter reports unavailable and callers degrade gracefully (gauge works
@@ -57,6 +60,19 @@ def _cfg():
     }
 
 
+_last_call_ts = 0.0
+
+
+def _throttle():
+    """Space out requests so free-tier TPM limits (Groq: 8k tokens/min) hold."""
+    global _last_call_ts
+    interval = float(os.environ.get("LLM_MIN_INTERVAL", "10"))
+    wait = interval - (time.time() - _last_call_ts)
+    if wait > 0:
+        time.sleep(wait)
+    _last_call_ts = time.time()
+
+
 def llm_available():
     cfg = _cfg()
     if not (cfg["base_url"] and cfg["api_key"] and cfg["model"]):
@@ -95,10 +111,11 @@ def read_article(title, body, retries=2):
 
     client = OpenAI(base_url=cfg["base_url"], api_key=cfg["api_key"],
                     timeout=cfg["timeout"], max_retries=0)
-    content = f"{title}\n\n{body[:4000]}"
+    content = f"{title}\n\n{body[:3000]}"
     last_err = None
     for attempt in range(1, retries + 1):
         try:
+            _throttle()
             resp = client.chat.completions.create(
                 model=cfg["model"],
                 messages=[{"role": "system", "content": SYSTEM_PROMPT},
@@ -114,9 +131,13 @@ def read_article(title, body, retries=2):
             last_err = err
             print(f"  [llm] attempt {attempt}/{retries} failed: {err}", file=sys.stderr)
             if attempt < retries:
-                time.sleep(2)
+                # 429 replies carry "Please try again in X s" -- honour exactly
+                # that (capped), otherwise a short generic pause.
+                hint = re.search(r"try again in ([\d.]+)s", str(err))
+                time.sleep(min(float(hint.group(1)) + 0.5, 20.0) if hint else 2.0)
     # One retry without response_format (some providers reject the field)
     try:
+        _throttle()
         resp = client.chat.completions.create(
             model=cfg["model"],
             messages=[{"role": "system", "content": SYSTEM_PROMPT},
