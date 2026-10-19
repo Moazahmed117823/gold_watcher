@@ -1,8 +1,0 @@
-{
-  "featuresRoot": "/home/codespace/.ori/global/features",
-  "host": "127.0.0.1",
-  "isGlobalWorkspace": true,
-  "name": "gold_watcher",
-  "port": 36475,
-  "workspaceRoot": "/workspaces/gold_watcher"
-}

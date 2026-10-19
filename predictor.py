@@ -77,6 +77,16 @@ UP_THRESHOLD, DOWN_THRESHOLD = 58, 42          # % outside this band = direction
 NOTIFY_DELTA = 15.0                            # points vs previous run
 ACCURACY_WINDOW = 30                           # graded rows for the accuracy stat
 
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+DIGEST_WEEKDAY = _env_int("DIGEST_WEEKDAY", 5)  # weekly digest day, 0=Mon..6=Sun; 5=Saturday
+
 try:  # Cairo time for the daily-digest logic (fallback UTC+3, Egypt DST-aware)
     from zoneinfo import ZoneInfo
     CAIRO = ZoneInfo("Africa/Cairo")
@@ -329,6 +339,175 @@ def send_telegram(text):
 
 
 # --------------------------------------------------------------------------- #
+# Daily / weekly / monthly digests
+# --------------------------------------------------------------------------- #
+def _load_pred_rows():
+    """Read predictions.csv -> (column map, data rows); (None, None) if empty."""
+    if not os.path.exists(PRED_PATH):
+        return None, None
+    with open(PRED_PATH, newline="", encoding="utf-8") as fh:
+        rows = [r for r in csv.reader(fh) if r]
+    if len(rows) < 2:
+        return None, None
+    return {name: i for i, name in enumerate(rows[0])}, rows[1:]
+
+
+def _val(r, col, name):
+    i = col.get(name)
+    return r[i] if i is not None and i < len(r) and r[i] != "" else None
+
+
+def _num(r, col, name):
+    try:
+        return float(_val(r, col, name))
+    except (TypeError, ValueError):
+        return None
+
+
+def _digest_core(day, col, title):
+    """Shared digest body over a list of prediction rows -> lines."""
+    out = [title]
+
+    def series(name):
+        return [x for x in (_num(r, col, name) for r in day) if x is not None]
+
+    g = series("final_pct")
+    if g:
+        out.append(f"- gauge: open {g[0]:.0f}% -> close {g[-1]:.0f}% "
+                   f"(low {min(g):.0f}, high {max(g):.0f})")
+    path, last_d = [], None
+    for r in day:
+        d = _val(r, col, "direction")
+        t = (_val(r, col, "timestamp_cairo") or "")[11:16]
+        if d and d != last_d:
+            path.append(f"{d} {t}" if t else str(d))
+            last_d = d
+    if len(path) > 6:  # long windows: compress the hops
+        out.append(f"- direction: {path[0]} -> ... -> {path[-1]} "
+                   f"({len(path) - 1} changes)")
+    elif len(path) > 1:
+        out.append("- direction: " + " -> ".join(path))
+    elif path:
+        out.append(f"- direction: {path[0]} all period")
+    p = series("price_21k")
+    if p:
+        out.append(f"- 21K: {p[0]:,.0f} -> {p[-1]:,.0f} EGP "
+                   f"({p[-1] - p[0]:+,.0f}, {(p[-1] - p[0]) / p[0] * 100:+.2f}%)")
+    x = series("global_xauusd")
+    if x:
+        out.append(f"- XAU/USD: {x[0]:,.2f} -> {x[-1]:,.2f} "
+                   f"({x[-1] - x[0]:+,.2f}, {(x[-1] - x[0]) / x[0] * 100:+.2f}%)")
+    d7 = series("divergence_7d")
+    if d7:
+        out.append(f"- local-vs-global: {d7[0]:+.2f} -> {d7[-1]:+.2f} pts "
+                   f"(max {max(d7, key=abs):+.2f})")
+    gp = series("parallel_gap_pct")
+    if gp:
+        out.append(f"- parallel gap: {gp[0]:+.2f}% -> {gp[-1]:+.2f}%")
+    return out
+
+
+def _grading_line(col, rows, want):
+    """want = set of UTC-date prefixes (or a single string) for graded rows."""
+    prefixes = {want} if isinstance(want, str) else want
+    graded = [r for r in rows
+              if (_val(r, col, "graded_at_utc") or "")[:10] in prefixes]
+    if graded:
+        ok = sum(1 for r in graded if _val(r, col, "predicted_correct") == "1")
+        return f"- grading: {ok}/{len(graded)} calls correct"
+    return None
+
+
+def _day_move_line(day, col):
+    """Biggest single-Cairo-day 21K move within the window (weekly/monthly)."""
+    per = {}
+    for r in day:
+        d = (_val(r, col, "timestamp_cairo") or "")[:10]
+        v = _num(r, col, "price_21k")
+        if d and v is not None:
+            per.setdefault(d, []).append(v)
+    moves = []
+    for d, vals in per.items():
+        if len(vals) >= 2 and vals[0]:
+            pct = (vals[-1] - vals[0]) / vals[0] * 100
+            moves.append((abs(pct), pct, d))
+    if not moves:
+        return None
+    _, pct, d = max(moves)
+    return f"- biggest 21K day move: {pct:+.2f}% on {d}"
+
+
+def _filter_day(rows, col, dates):
+    dates = {dates} if isinstance(dates, str) else dates
+    return [r for r in rows
+            if (_val(r, col, "timestamp_cairo") or "")[:10] in dates]
+
+
+def build_daily_digest():
+    """Yesterday's runs (Cairo)."""
+    col, rows = _load_pred_rows()
+    if not rows:
+        return None
+    yest = (cairo_now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    day = _filter_day(rows, col, yest)
+    if not day:
+        return None
+    out = _digest_core(day, col, f"Daily digest - {yest} ({len(day)} runs)")
+    gl = _grading_line(col, rows, yest)
+    if gl:
+        out.append(gl)
+    return out
+
+
+def build_weekly_digest():
+    """Rolling last-7-Cairo-days window ending yesterday."""
+    col, rows = _load_pred_rows()
+    if not rows:
+        return None
+    dates = {(cairo_now() - timedelta(days=k)).strftime("%Y-%m-%d")
+             for k in range(1, 8)}
+    day = _filter_day(rows, col, dates)
+    if not day:
+        return None
+    out = _digest_core(day, col,
+                       f"Weekly digest - {min(dates)} -> {max(dates)} "
+                       f"({len(day)} runs)")
+    mv = _day_move_line(day, col)
+    if mv:
+        out.append(mv)
+    gl = _grading_line(col, rows, dates)
+    if gl:
+        out.append(gl)
+    return out
+
+
+def build_monthly_digest():
+    """The previous calendar Cairo month."""
+    col, rows = _load_pred_rows()
+    if not rows:
+        return None
+    first_this = cairo_now().strftime("%Y-%m-01")
+    prev_end = datetime.strptime(first_this, "%Y-%m-%d") - timedelta(days=1)
+    ym = prev_end.strftime("%Y-%m")
+    day = [r for r in rows
+           if (_val(r, col, "timestamp_cairo") or "").startswith(ym)]
+    if not day:
+        return None
+    out = _digest_core(day, col,
+                       f"Monthly digest - {prev_end.strftime('%B %Y')} "
+                       f"({len(day)} runs)")
+    mv = _day_move_line(day, col)
+    if mv:
+        out.append(mv)
+    graded = [r for r in rows
+              if (_val(r, col, "graded_at_utc") or "").startswith(ym)]
+    if graded:
+        ok = sum(1 for r in graded if _val(r, col, "predicted_correct") == "1")
+        out.append(f"- grading: {ok}/{len(graded)} calls correct")
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main():
@@ -354,6 +533,8 @@ def main():
             delta = pct - float(prev["final_pct"])
         except ValueError:
             delta = None
+    prev_cairo_date = (prev.get("timestamp_cairo", "")[:10] if prev else "")
+    new_day = cairo_now().strftime("%Y-%m-%d") != prev_cairo_date
 
     accuracy = None if args.dry_run else grade_pending()
     if not args.dry_run:
@@ -410,6 +591,31 @@ def main():
         lines.append(f"Gauge accuracy ({accuracy['n']} graded calls): {accuracy['pct']}%")
     lines.append("Bias gauge, not financial advice.")
 
+    # Morning digests: daily every Cairo day; weekly rides on DIGEST_WEEKDAY
+    # (default Saturday = 5), monthly on the 1st - all inside the ONE morning
+    # message. Dry-run previews whatever would fire today (read-only).
+    def _safe(fn):
+        try:
+            return fn()
+        except Exception as err:  # noqa: BLE001
+            print(f"  [digest] {getattr(fn, '__name__', 'digest')} skipped: {err}",
+                  file=sys.stderr)
+            return None
+
+    head = []
+    if args.dry_run or new_day:
+        parts = [_safe(build_daily_digest)]
+        if cairo_now().weekday() == DIGEST_WEEKDAY:
+            parts.append(_safe(build_weekly_digest))
+        if cairo_now().day == 1:
+            parts.append(_safe(build_monthly_digest))
+        for part in parts:
+            if part:
+                head += part + [""]
+    if head:
+        head[-1] = "Right now:"
+        lines = head + lines
+
     message = "\n".join(lines)
     print(message)
     if args.json:
@@ -447,8 +653,6 @@ def main():
 
     # ---- notify decision: only when it is worth a message ----
     prev_dir = prev.get("direction") if prev else None
-    prev_cairo_date = (prev.get("timestamp_cairo", "")[:10] if prev else "")
-    new_day = cairo_now().strftime("%Y-%m-%d") != prev_cairo_date
     should_notify = bool(args.force or prev is None or new_day
                          or prev_dir != direction
                          or (delta is not None and abs(delta) >= NOTIFY_DELTA))
