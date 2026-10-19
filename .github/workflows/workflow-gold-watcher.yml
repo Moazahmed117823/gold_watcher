@@ -13,12 +13,10 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     env:
       # ============================================================
       # 21K TARGET PRICE (EGP) - edit this one number whenever you like.
-      # You get a Telegram alert when the 21K gram price CROSSES this
-      # level (rises above it or falls below it). Set to 0 to disable.
       # ============================================================
       TARGET_21K: '6500'
 
@@ -37,22 +35,30 @@ jobs:
 
       - name: Fetch gold prices
         env:
-          # Telegram (primary channel - see README Step 4 for 2-minute setup)
+          # Telegram (primary channel)
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # Optional WhatsApp via Green API free tier (see README Step 4b):
-          # GREENAPI_INSTANCE_ID: ${{ secrets.GREENAPI_INSTANCE_ID }}
-          # GREENAPI_API_TOKEN: ${{ secrets.GREENAPI_API_TOKEN }}
-          # WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
-          # CallMeBot is currently full for new signups; kept for later:
-          # CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
         run: python scraper.py
+
+      # ============================================================
+      # NEW: prediction gauge (technical + TradingView + AI news reader)
+      # Degrades gracefully: if LLM_API_KEY is unset it still computes
+      # the gauge from technical + consensus only.
+      # ============================================================
+      - name: Run prediction gauge
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LLM_BASE_URL: https://api.groq.com/openai/v1
+          LLM_MODEL: llama-3.1-8b-instant
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: python predictor.py
 
       - name: Commit price history
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/gold_prices.csv
+          git add data/
           if git diff --cached --quiet; then
             echo "No new data to commit."
           else

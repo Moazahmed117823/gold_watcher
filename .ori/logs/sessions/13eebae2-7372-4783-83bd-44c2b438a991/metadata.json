@@ -1,0 +1,27 @@
+{
+  "completedTurns": 0,
+  "endedAt": "2026-10-19T13:26:20.193Z",
+  "failedTurns": 1,
+  "harness": "ori",
+  "lastEventType": "turn.failed",
+  "runIds": [
+    {
+      "cwd": "/workspaces/gold_watcher",
+      "model": "z-ai/glm-5.3-flash:floor",
+      "prompt": "hello",
+      "runId": "0bb99dec-bb90-4004-81c1-5e1587ad50a8",
+      "source": {
+        "surface": "code"
+      }
+    }
+  ],
+  "sessionId": "13eebae2-7372-4783-83bd-44c2b438a991",
+  "startedAt": "2026-10-19T13:26:18.745Z",
+  "usage": {
+    "cacheCreationTokens": 0,
+    "cacheReadTokens": 0,
+    "contextTokens": 0,
+    "inputTokens": 0,
+    "outputTokens": 0
+  }
+}
