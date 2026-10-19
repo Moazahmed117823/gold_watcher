@@ -33,6 +33,10 @@ SYSTEM_PROMPT = (
     '"summary": "<= 12 words"}\n'
     "Rules:\n"
     "- bias is what the TEXT argues for gold's near-term direction, not your opinion.\n"
+    "- The text may be a headline only. Headlines can carry direction (e.g. 'gold "
+    "rallies', 'XAU/USD plunges', 'eyes a rebound', Arabic 'يرتفع'/'يتراجع'): if the "
+    "headline states a direction, use it with confidence<=60. If it only reports past "
+    "prices with no direction, bias=neutral.\n"
     "- Only include levels whose NUMBERS literally appear in the text. If none, levels=[].\n"
     "- Choose the unit that matches the number's context in the text. When unsure, omit.\n"
     "- If the text is not about gold markets, or gives no direction: bias=neutral, confidence<=20.\n"

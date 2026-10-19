@@ -3,8 +3,9 @@
 Gold news reader: RSS -> article text -> LLM extraction -> verified levels.
 ==========================================================================
 Pipeline per run:
-  1. Pull latest headlines from RSS feeds (Google News EN + AR, Investing.com)
-  2. Filter to gold-relevant items, keep the N most recent
+  1. Pull latest headlines from RSS feeds (Yahoo gold futures, Google News
+     EN + AR, ForexLive, Investing.com)
+  2. Filter to gold-relevant items, round-robin across feeds, keep the N most useful
   3. Fetch article bodies, extract readable text
   4. LLM extracts {bias, confidence, levels[]} per article  (llm.py adapter)
   5. VERIFICATION PASS: every extracted price must literally appear in the
@@ -28,14 +29,24 @@ from bs4 import BeautifulSoup
 
 import llm
 
+YAHOO_GC_RSS = ("https://feeds.finance.yahoo.com/rss/2.0/headline?s=GC=F"
+                "&region=US&lang=en-US")     # gold futures: DIRECT article links
 GOOGLE_NEWS_EN = ("https://news.google.com/rss/search?q=gold+price+forecast+OR+"
                   "xauusd+OR+%22gold+rally%22&hl=en-US&gl=US&ceid=US:en")
 GOOGLE_NEWS_AR = ("https://news.google.com/rss/search?q=%D8%A3%D8%B3%D8%B9%D8%A7%D8%B1+"
                   "%D8%A7%D9%84%D8%B0%D9%87%D8%A8&hl=ar&gl=EG&ceid=EG:ar")
+FOREXLIVE_RSS = "https://www.forexlive.com/feed/news"
 INVESTING_RSS = "https://www.investing.com/rss/news_11.rss"
 
-RSS_FEEDS = [("google-news-en", GOOGLE_NEWS_EN), ("google-news-ar", GOOGLE_NEWS_AR),
+RSS_FEEDS = [("yahoo-gold-futures", YAHOO_GC_RSS),
+             ("google-news-en", GOOGLE_NEWS_EN),
+             ("google-news-ar", GOOGLE_NEWS_AR),
+             ("forexlive", FOREXLIVE_RSS),
              ("investing-commodities", INVESTING_RSS)]
+
+# news.google.com links are JS redirect wrappers -> fetching them returns an
+# 11-char page ("Google News"). Treat these feeds as headline-only sources.
+WRAPPER_FEEDS = ("google-news",)
 
 GOLD_KEYWORDS = re.compile(
     r"gold|xau|bullion|fed|dollar|([\u0600-\u06FF]*\u0630\u0647\u0628)", re.IGNORECASE)
@@ -84,18 +95,38 @@ def collect_headlines(max_per_feed=12):
                     break
         except Exception as err:  # noqa: BLE001 - one dead feed must not kill the run
             print(f"  [news] feed {name} failed: {err}", file=sys.stderr)
-    out.sort(key=lambda x: x["title"])     # stable order
+    # Round-robin interleave so the top N articles span every feed instead
+    # of clustering into whichever feed sorts first alphabetically.
+    buckets = {}
+    for it in out:
+        buckets.setdefault(it["feed"], []).append(it)
+    out = []
+    while any(buckets.values()):
+        for name, _ in RSS_FEEDS:
+            if buckets.get(name):
+                out.append(buckets[name].pop(0))
     return out
 
 
 def fetch_article_text(url, timeout=15, max_chars=4000):
-    """Fetch an article page and return visible text (BeautifulSoup)."""
+    """Fetch an article page and return readable text (BeautifulSoup).
+
+    Prefers <p> paragraphs (skips nav menus, icon-font glyph walls and
+    cookie banners); falls back to whole-page text if too little is found.
+    """
     resp = requests.get(url, headers=HEADERS, timeout=timeout)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
     for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
         tag.decompose()
-    text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+    paras = []
+    for p in soup.find_all("p"):
+        t = re.sub(r"\s+", " ", p.get_text(" ", strip=True))
+        if len(t) >= 40:                       # skip buttons, links, captions
+            paras.append(t)
+    text = " ".join(paras)
+    if len(text) < 200:
+        text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
     return text[:max_chars]
 
 
@@ -157,8 +188,9 @@ def read_news(max_articles=4, fetch_bodies=True):
         try:
             # Google News links are redirect wrappers; the description often
             # carries enough context, so use title+desc as the minimum corpus.
+            is_wrapper = item["feed"].startswith(WRAPPER_FEEDS)
             body = item["description"]
-            if fetch_bodies and item["link"].startswith("http"):
+            if fetch_bodies and not is_wrapper and item["link"].startswith("http"):
                 try:
                     body = (fetch_article_text(item["link"]) or "") or body
                 except Exception as err:  # noqa: BLE001
