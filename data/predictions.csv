@@ -1,0 +1,2 @@
+timestamp_utc,timestamp_cairo,final_pct,direction,confidence,technical,consensus,news,price_21k,global_xauusd,local_chg_7d,global_chg_7d,divergence_7d,price_24h_later,predicted_correct,graded_at_utc,usdegp_official,parallel_gap_pct,real_premium_pct,formula_dev_pct
+2026-10-19 19:11:27,2026-10-19 22:11:27,44,FLAT,moderate,0.109,-0.288,-0.417,6275.0,4143.93,+1.455,-1.088,+2.543,,,,53.5247,+0.570,,-0.008
