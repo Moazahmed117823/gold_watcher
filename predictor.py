@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Prediction gauge orchestrator.
+Prediction gauge orchestrator (v10).
 ==============================
 Runs the three signal groups (technical, consensus, news), merges them into
 one bias percentage, logs every prediction, self-grades yesterday's calls,
 maintains the 7-day "levels map" from verified analyst levels, and sends a
-compact Telegram message only when it is worth sending (direction flip,
->=15-point move, first run of the Cairo day, or --force).
+compact Telegram message only when it is worth sending (gauge-ladder alarm,
+direction flip, >=15-point move, first run of the Cairo day, or --force).
+Morning runs also prepend daily/weekly/monthly digests of past performance.
 
 Files written (both committed by the workflow):
     data/predictions.csv     one row per run + grading columns
@@ -86,6 +87,16 @@ def _env_int(name, default):
 
 
 DIGEST_WEEKDAY = _env_int("DIGEST_WEEKDAY", 5)  # weekly digest day, 0=Mon..6=Sun; 5=Saturday
+
+# Gauge ladder: the gauge read as a price-o-meter. Each height the gauge
+# climbs to (or falls to) is translated into the 21K move that height has
+# meant. Every rung rings once per Cairo day, the run it is first crossed.
+LADDER_UP = (58, 65, 72, 80, 90)     # heights above the FLAT band (42-58)
+LADDER_DOWN = (42, 35, 28, 20, 10)   # mirror below it
+# Rough by-design meaning of each height (next-day 21K move, %) until your
+# own log has enough samples (>=3) for the measured answer to take over.
+LADDER_EST = {58: 0.5, 65: 0.9, 72: 1.3, 80: 1.8, 90: 2.5,
+              42: -0.5, 35: -0.9, 28: -1.3, 20: -1.8, 10: -2.5}
 
 try:  # Cairo time for the daily-digest logic (fallback UTC+3, Egypt DST-aware)
     from zoneinfo import ZoneInfo
@@ -508,6 +519,118 @@ def build_monthly_digest():
 
 
 # --------------------------------------------------------------------------- #
+# Gauge ladder alarm (gauge height translated into 21K moves)
+# --------------------------------------------------------------------------- #
+def _ladder_points(col, rows):
+    """[(dt, gauge, price)] sorted by time; rows without gauge dropped."""
+    pts = []
+    for r in rows:
+        ts = _val(r, col, "timestamp_cairo")
+        g = _num(r, col, "final_pct")
+        p = _num(r, col, "price_21k")
+        if not ts or g is None:
+            continue
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                pts.append((datetime.strptime(ts, fmt), g, p))
+                break
+            except ValueError:
+                continue
+    pts.sort(key=lambda x: x[0])
+    return pts
+
+
+def _gauge_move_stats(pts):
+    """Gauge zone -> (avg next-day 21K move %, samples) from the own log.
+
+    Zone = the highest up-rung reached (or lowest down-rung), 0 = FLAT band.
+    'Next-day move' = the 21K price 21-36h later vs now - the same reality
+    check the self-grading loop uses.
+    """
+    buckets = {}
+    for ts, g, p in pts:
+        if p is None:
+            continue
+        nxt = next(((t2, p2) for t2, _, p2 in pts
+                    if t2 > ts and p2 is not None
+                    and 21.0 <= (t2 - ts).total_seconds() / 3600.0 <= 36.0),
+                   None)
+        if not nxt:
+            continue
+        move = (nxt[1] - p) / p * 100.0
+        if g >= LADDER_UP[0]:
+            zone = max(r for r in LADDER_UP if r <= g)
+        elif g <= LADDER_DOWN[0]:
+            zone = min(r for r in LADDER_DOWN if r >= g)
+        else:
+            zone = 0
+        buckets.setdefault(zone, []).append(move)
+    return {z: (sum(v) / len(v), len(v)) for z, v in buckets.items()}
+
+
+def _ladder_meaning(rung, stats, price):
+    """(pct, egp, source): what a ladder height has meant for 21K next day."""
+    if rung in stats and stats[rung][1] >= 3:
+        pct, n = stats[rung]
+        src = f"measured from {n} runs in your log"
+    else:
+        pct = LADDER_EST.get(rung, 0.0)
+        src = "rough estimate"
+    egp = pct / 100.0 * price if price else None
+    return pct, egp, src
+
+
+def detect_gauge_alarm(verbose=False):
+    """Ring when the gauge reaches a height it has not touched today.
+
+    Ladder: 58 / 65 / 72 / 80 / 90 climbing, 42 / 35 / 28 / 20 / 10 falling.
+    A rung rings ONCE per Cairo day, on the run it is first crossed, and the
+    message translates the height into the 21K move that height has meant
+    (measured from your own log once it has >=3 samples at that height,
+    rough by-design estimate before that).
+    verbose=True (--dry-run) also reports a quiet ladder.
+    """
+    col, rows = _load_pred_rows()
+    if not rows:
+        return []
+    pts = _ladder_points(col, rows)
+    if len(pts) < 2:
+        return []
+    today = cairo_now().date()
+    last_ts, last_g, last_p = pts[-1]
+    prev_g = pts[-2][1]
+
+    def reached_earlier_today(gauge, side):
+        return any(t.date() == today and
+                   (g >= gauge if side == "up" else g <= gauge)
+                   for t, g, _ in pts[:-2])
+
+    new_up = [r for r in LADDER_UP
+              if prev_g < r <= last_g and not reached_earlier_today(r, "up")]
+    new_down = [r for r in LADDER_DOWN
+                if prev_g > r >= last_g and not reached_earlier_today(r, "down")]
+    if not new_up and not new_down:
+        if verbose:
+            todays = [g for t, g, _ in pts if t.date() == today]
+            extra = (f" (highest so far today: {max(todays):.0f})"
+                     if todays else "")
+            return [f"(ladder) gauge {last_g:.0f}% - no new level today{extra}"]
+        return []
+
+    if new_up:
+        rung, word = max(new_up), "climbed to"
+    else:
+        rung, word = min(new_down), "fell to"
+    pct, egp, src = _ladder_meaning(rung, _gauge_move_stats(pts), last_p)
+    amount = f"{egp:+,.0f} EGP " if egp is not None else ""
+    levels = len(new_up or new_down)
+    return [f"GAUGE ALARM: gauge {word} {last_g:.0f}% "
+            f"({levels} new level{'s' if levels > 1 else ''} today)",
+            f"Heights like this have meant: 21K next day about "
+            f"{amount}({pct:+.1f}%) [{src}]"]
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main():
@@ -602,7 +725,17 @@ def main():
                   file=sys.stderr)
             return None
 
+    # Gauge-ladder alarm: rings when the gauge reaches a height it has not
+    # touched today, and says what 21K move that height has meant.
+    try:
+        alarms = detect_gauge_alarm(verbose=args.dry_run)
+    except Exception as err:  # noqa: BLE001
+        print(f"  [ladder] check failed: {err}", file=sys.stderr)
+        alarms = []
+
     head = []
+    if alarms:
+        head += alarms + [""]
     if args.dry_run or new_day:
         parts = [_safe(build_daily_digest)]
         if cairo_now().weekday() == DIGEST_WEEKDAY:
@@ -655,7 +788,8 @@ def main():
     prev_dir = prev.get("direction") if prev else None
     should_notify = bool(args.force or prev is None or new_day
                          or prev_dir != direction
-                         or (delta is not None and abs(delta) >= NOTIFY_DELTA))
+                         or (delta is not None and abs(delta) >= NOTIFY_DELTA)
+                         or alarms)
     if should_notify:
         try:
             send_telegram(message)
