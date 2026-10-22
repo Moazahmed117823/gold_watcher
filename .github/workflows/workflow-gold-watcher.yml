@@ -2,9 +2,6 @@ name: Egypt Gold Watcher
 
 on:
   workflow_dispatch:      # allows manual "Run workflow" button in the Actions tab
-  schedule:
-    - cron: '15 * * * *'  # every hour at :15 UTC - GitHub itself runs it now,
-                          # no outside cron service needed anymore
 
 permissions:
   contents: write        # needed so the workflow can commit the updated CSV
