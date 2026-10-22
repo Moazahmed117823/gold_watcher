@@ -28,6 +28,7 @@ Usage (from predictor.py):
 import csv
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -37,6 +38,41 @@ GRAMS_PER_OUNCE = 31.1034768
 FORMULA_BREAK_PCT = 0.5          # |dev| beyond this = site formula changed
 REAL_REPORT_MAX_AGE_DAYS = 7     # souq reports older than this are ignored
 REAL_MATCH_WINDOW_HOURS = 12     # nearest site quote to a report, ±hours
+FX_CACHE_SECONDS = 600           # re-use one official-rate answer for 10 min
+
+# Line templates per language (ar = Egyptian-friendly MSA)
+_LINES = {
+    "formula": {
+        "en": "- WARNING site formula changed: 21K deviates {dev:+.2f}% "
+              "from ounce x rate (real premium appearing in source?)",
+        "ar": "- تحذير: معادلة الموقع تغيرت — 21ك يبتعد {dev:+.2f}% "
+              "عن (الأوقية × سعر الدولار) — علاوة حقيقية تظهر في المصدر؟"},
+    "gap": {
+        "en": "- parallel-dollar: site {site:.2f} vs official {off:.2f} "
+              "-> gap {gap:+.2f}%{trend}",
+        "ar": "- الدولار الموازي: سعر الموقع {site:.2f} مقابل الرسمي {off:.2f} "
+              "→ الفجوة {gap:+.2f}%{trend}"},
+    "gap_trend": {
+        "en": ", 7d ago {trend_val:+.2f}% -> {word}",
+        "ar": "، قبل 7 أيام {trend_val:+.2f}% → {word}"},
+    "gap_widening": {"en": "widening", "ar": "تتسع"},
+    "gap_narrowing": {"en": "narrowing", "ar": "تضيق"},
+    "gap_stable": {"en": "stable", "ar": "مستقرة"},
+    "souq": {
+        "en": "- real souq premium: {rp:+.2f}% vs site reference "
+              "(your reports, {days}d window)",
+        "ar": "- علاوة السوق الحقيقية: {rp:+.2f}% مقابل مرجع الموقع "
+              "(تقاريرك، نافذة {days} يوم)"},
+}
+
+
+def _txt(lang, key, **kw):
+    entry = _LINES.get(key) or {}
+    tmpl = entry.get(lang) or entry.get("en") or ""
+    try:
+        return tmpl.format(**kw)
+    except (KeyError, IndexError, ValueError):
+        return tmpl
 
 
 def _utcnow():
@@ -57,12 +93,21 @@ def _last_row(path):
     return dict(zip(rows[0], rows[-1]))
 
 
+_FX_CACHE = {"t": 0.0, "v": None}
+
+
 def official_usdegp(timeout=10):
-    """Official (interbank) USD/EGP. None on any failure."""
+    """Official (interbank) USD/EGP, cached 10 min. None on any failure."""
+    now = time.time()
+    if _FX_CACHE["v"] is not None and now - _FX_CACHE["t"] < FX_CACHE_SECONDS:
+        return _FX_CACHE["v"]
     try:
         j = requests.get(OFFICIAL_FX_URL, timeout=timeout).json()
         v = float(j["rates"]["EGP"])
-        return v if v > 0 else None
+        if v > 0:
+            _FX_CACHE["t"], _FX_CACHE["v"] = now, v
+            return v
+        return None
     except Exception:  # noqa: BLE001 - fail-soft by design
         return None
 
@@ -137,11 +182,12 @@ def _gap_trend(pred_path, days=7):
     return best
 
 
-def measure(csv_path, pred_path=None, real_csv=None):
+def measure(csv_path, pred_path=None, real_csv=None, lang="en"):
     """Full monitoring pass. Returns dict with message lines + raw fields.
 
     Keys: lines(list[str]), official, gap_pct, gap_trend(delta pts),
           real_premium_pct, formula_dev_pct, n_real_reports
+    lang: "en" or "ar" - only affects the message lines, never the data.
     """
     if pred_path is None:
         pred_path = os.path.join(os.path.dirname(csv_path), "predictions.csv")
@@ -167,9 +213,7 @@ def measure(csv_path, pred_path=None, real_csv=None):
         dev = (p21 / implied - 1.0) * 100.0
         out["formula_dev_pct"] = dev
         if abs(dev) > FORMULA_BREAK_PCT:
-            out["lines"].append(
-                f"- WARNING site formula changed: 21K deviates {dev:+.2f}% "
-                f"from ounce x rate (real premium appearing in source?)")
+            out["lines"].append(_txt(lang, "formula", dev=dev))
 
     # 2. parallel-dollar gap vs the official rate
     off = official_usdegp()
@@ -182,12 +226,12 @@ def measure(csv_path, pred_path=None, real_csv=None):
         if trend is not None:
             delta = gap - trend
             out["gap_trend"] = delta
-            word = ("widening" if delta > 0.25 else
-                    "narrowing" if delta < -0.25 else "stable")
-            ttxt = f", 7d ago {trend:+.2f}% -> {word}"
+            word_key = ("gap_widening" if delta > 0.25 else
+                        "gap_narrowing" if delta < -0.25 else "gap_stable")
+            ttxt = _txt(lang, "gap_trend", trend_val=trend,
+                        word=_txt(lang, word_key))
         out["lines"].append(
-            f"- parallel-dollar: site {site_rate:.2f} vs official {off:.2f} "
-            f"-> gap {gap:+.2f}%{ttxt}")
+            _txt(lang, "gap", site=site_rate, off=off, gap=gap, trend=ttxt))
 
     # 3. your real souq reports vs the site reference
     rp = real_premium(real_csv, csv_path)
@@ -200,8 +244,7 @@ def measure(csv_path, pred_path=None, real_csv=None):
         except OSError:
             pass
         out["lines"].append(
-            f"- real souq premium: {rp:+.2f}% vs site reference "
-            f"(your reports, {REAL_REPORT_MAX_AGE_DAYS}d window)")
+            _txt(lang, "souq", rp=rp, days=REAL_REPORT_MAX_AGE_DAYS))
 
     return out
 

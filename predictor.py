@@ -1,17 +1,31 @@
 #!/usr/bin/env python3
 """
-Prediction gauge orchestrator (v10).
+Prediction gauge orchestrator (v11).
 ==============================
 Runs the three signal groups (technical, consensus, news), merges them into
 one bias percentage, logs every prediction, self-grades yesterday's calls,
 maintains the 7-day "levels map" from verified analyst levels, and sends a
 compact Telegram message only when it is worth sending (gauge-ladder alarm,
-direction flip, >=15-point move, first run of the Cairo day, or --force).
+sell-window milestone, direction flip, >=15-point move, first run of the
+Cairo day, or --force).
 Morning runs also prepend daily/weekly/monthly digests of past performance.
 
-Files written (both committed by the workflow):
+v11 additions:
+  - SELL WINDOW milestone: flags when the 21K price rises a certain amount
+    above the day's average price (yesterday's outlier-trimmed average during
+    the first hours of the Cairo day) - the classic local "chance to sell".
+  - Fresh alarms: the ladder alarm describes the run it fires in (no lag).
+  - Anti-twitch: a weak crossing must clear its rung by LADDER_CONFIRM pts
+    (or hold for 2 runs) before it rings; strong jumps ring instantly.
+  - Alarm report card: past alarms are graded (data/alarms.csv) and scored.
+  - Dual accuracy: direction-only accuracy shown next to the strict one.
+  - Honest window wording + pace note (24h speed vs the usual pace).
+  - Multi-recipient Telegram with per-recipient language (English/Arabic).
+
+Files written (all committed by the workflow):
     data/predictions.csv     one row per run + grading columns
     data/levels_history.csv  every verified analyst level with timestamp
+    data/alarms.csv          every alarm raised, with its later report card
 
 Designed to run AFTER scraper.py in the same workflow so gold_prices.csv
 is fresh. Never raises on partial failures: missing groups are skipped and
@@ -41,6 +55,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_PATH = os.path.join(BASE_DIR, "data", "gold_prices.csv")
 PRED_PATH = os.path.join(BASE_DIR, "data", "predictions.csv")
 LEVELS_PATH = os.path.join(BASE_DIR, "data", "levels_history.csv")
+ALARMS_PATH = os.path.join(BASE_DIR, "data", "alarms.csv")
 
 PRED_HEADER = ["timestamp_utc", "timestamp_cairo", "final_pct", "direction",
                "confidence", "technical", "consensus", "news", "price_21k",
@@ -49,6 +64,8 @@ PRED_HEADER = ["timestamp_utc", "timestamp_cairo", "final_pct", "direction",
                "usdegp_official", "parallel_gap_pct", "real_premium_pct",
                "formula_dev_pct"]
 LEVELS_HEADER = ["timestamp_utc", "price", "unit", "type", "title"]
+ALARMS_HEADER = ["timestamp_utc", "timestamp_cairo", "kind", "detail",
+                 "est_pct", "price", "graded", "actual_pct", "verdict"]
 
 def _env_weight(name, default):
     """Read a positive float weight from env; fall back to default on bad input."""
@@ -86,17 +103,45 @@ def _env_int(name, default):
         return default
 
 
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
 DIGEST_WEEKDAY = _env_int("DIGEST_WEEKDAY", 5)  # weekly digest day, 0=Mon..6=Sun; 5=Saturday
+
+# Anti-twitch: a crossing must clear its rung by this many points to ring
+# instantly; a weaker crossing waits until the gauge HOLDS the rung for a
+# second run. 0 = every crossing rings instantly (old behaviour).
+LADDER_CONFIRM = _env_float("LADDER_CONFIRM", 2.0)
+
+# SELL WINDOW milestone: rings when 21K rises this far above the day's
+# average price (percent, or absolute EGP line; 0 disables a knob).
+MILESTONE_PCT = _env_float("MILESTONE_PCT", 0.5)
+MILESTONE_EGP = _env_float("MILESTONE_EGP", 0.0)
+# Until this many runs exist today (3 runs = first ~3 hours at hourly
+# cadence), the baseline is yesterday's average with outliers trimmed.
+MILESTONE_MIN_RUNS = _env_int("MILESTONE_MIN_RUNS", 3)
+
+# Default message language for recipients without an explicit ":lang" tag.
+TELEGRAM_DEFAULT_LANG = (os.environ.get("TELEGRAM_LANG", "en").strip().lower()
+                         or "en")
 
 # Gauge ladder: the gauge read as a price-o-meter. Each height the gauge
 # climbs to (or falls to) is translated into the 21K move that height has
-# meant. Every rung rings once per Cairo day, the run it is first crossed.
+# meant. Every rung rings once per Cairo day, on the run it crosses (fresh),
+# guarded by the anti-twitch confirmation rule (LADDER_CONFIRM).
 LADDER_UP = (58, 65, 72, 80, 90)     # heights above the FLAT band (42-58)
 LADDER_DOWN = (42, 35, 28, 20, 10)   # mirror below it
 # Rough by-design meaning of each height (next-day 21K move, %) until your
 # own log has enough samples (>=3) for the measured answer to take over.
 LADDER_EST = {58: 0.5, 65: 0.9, 72: 1.3, 80: 1.8, 90: 2.5,
               42: -0.5, 35: -0.9, 28: -1.3, 20: -1.8, 10: -2.5}
+# An alarm counts as "on target" in the report card when the real move
+# reached at least this fraction of the promised move, same direction.
+ALARM_HIT_FRACTION = 0.5
 
 try:  # Cairo time for the daily-digest logic (fallback UTC+3, Egypt DST-aware)
     from zoneinfo import ZoneInfo
@@ -274,7 +319,12 @@ def grade_pending():
 
 
 def _accuracy():
-    """Rolling accuracy over the last ACCURACY_WINDOW graded rows."""
+    """Rolling accuracy over the last ACCURACY_WINDOW graded rows.
+
+    Returns both scores:
+      strict    - the existing rule (direction AND landing window matter)
+      direction - among UP/DOWN calls only: did the price move that way at all
+    """
     if not os.path.exists(PRED_PATH):
         return None
     with open(PRED_PATH, newline="", encoding="utf-8") as fh:
@@ -287,7 +337,28 @@ def _accuracy():
     if not recent:
         return None
     hits = sum(1 for r in recent if r[col["predicted_correct"]] == "1")
-    return {"hits": hits, "n": len(recent), "pct": round(100.0 * hits / len(recent))}
+    out = {"hits": hits, "n": len(recent), "pct": round(100.0 * hits / len(recent))}
+    # direction-only score over non-FLAT calls (price move vs called side)
+    d_hits = d_n = 0
+    for r in recent:
+        direction = col["direction"] < len(r) and r[col["direction"]]
+        if direction not in ("UP", "DOWN"):
+            continue
+        try:
+            called = float(r[col["price_21k"]])
+            later = float(r[col["price_24h_later"]])
+        except (ValueError, KeyError, TypeError):
+            continue
+        if not called:
+            continue
+        move = (later - called) / called
+        good = move > 0 if direction == "UP" else move < 0
+        d_n += 1
+        d_hits += 1 if good else 0
+    if d_n:
+        out["dir_hits"], out["dir_n"] = d_hits, d_n
+        out["dir_pct"] = round(100.0 * d_hits / d_n)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -302,7 +373,7 @@ def update_levels(levels):
             "unit": lvl["unit"], "type": lvl["type"], "title": lvl["title"]})
 
 
-def summarize_levels(current_21k):
+def summarize_levels(current_21k, lang="en"):
     """Most-cited levels over the last 7 days, per (unit, type)."""
     if not os.path.exists(LEVELS_PATH):
         return []
@@ -327,26 +398,191 @@ def summarize_levels(current_21k):
         side = ""
         if unit == "EGP/gram" and current_21k:
             dist = (price - current_21k) / current_21k * 100.0
-            side = f" ({dist:+.1f}% from now)"
-        parts.append(f"{price:,} {unit.split('/')[1]} {ltype} x{n}{side}")
+            side = " " + T(lang, "lvl_fromnow", d=dist)
+        unit_word = (T(lang, "lvl_gram") if "gram" in unit
+                     else T(lang, "lvl_ounce") if "ounce" in unit
+                     else unit.split("/")[1])
+        type_word = (T(lang, "lvl_" + ltype) if ltype in ("target", "support", "resistance")
+                     else ltype)
+        parts.append(f"{price:,} {unit_word} {type_word} x{n}{side}")
     return parts
 
 
 # --------------------------------------------------------------------------- #
-# Telegram
+# Telegram (multi-recipient, per-recipient language)
 # --------------------------------------------------------------------------- #
-def send_telegram(text):
+# TELEGRAM_CHAT_ID accepts a comma list. Each entry is "chat_id" or
+# "chat_id:lang" where lang is en / ar / both. Entries without a tag use
+# TELEGRAM_LANG (default en).  Example: "111222333:ar, 444555666"
+def _recipients():
+    raw = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if not raw:
+        return []
+    out = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        cid, _, tag = part.partition(":")
+        lang = (tag or TELEGRAM_DEFAULT_LANG).strip().lower()
+        if lang not in ("en", "ar", "both"):
+            lang = "en"
+        cid = cid.strip()
+        if cid:
+            out.append((cid, lang))
+    return out
+
+
+def send_telegram(messages):
+    """messages: {"en": text, "ar": text} - each recipient gets its language.
+
+    Never raises past the caller's fail-soft wrapper; returns True if any
+    delivery succeeded.
+    """
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-    if not (token and chat_id):
+    recips = _recipients()
+    if not (token and recips):
         print("  [telegram] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set -> skipped")
         return False
-    resp = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                         json={"chat_id": chat_id, "text": text,
-                               "disable_web_page_preview": True}, timeout=15)
-    resp.raise_for_status()
-    print("  [telegram] gauge message delivered")
-    return True
+    ok = False
+    for cid, lang in recips:
+        for lg in ((lang,) if lang != "both" else ("en", "ar")):
+            text = messages.get(lg) or messages.get("en")
+            if not text:
+                continue
+            try:
+                resp = requests.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json={"chat_id": cid, "text": text,
+                          "disable_web_page_preview": True}, timeout=15)
+                resp.raise_for_status()
+                print(f"  [telegram] delivered to {cid} ({lg})")
+                ok = True
+            except Exception as err:  # noqa: BLE001 - one chat failing = others still get it
+                print(f"  [telegram] delivery to {cid} ({lg}) failed: {err}",
+                      file=sys.stderr)
+    return ok
+
+
+# --------------------------------------------------------------------------- #
+# Language: every message string via T(lang, key, **kw); missing -> English
+# --------------------------------------------------------------------------- #
+TRANSLATIONS = {
+    "ladder_up": {"en": "GAUGE ALARM: gauge just climbed to {gauge:.0f}% ({levels})",
+                  "ar": "تنبيه المؤشر: المؤشر صعد الآن إلى {gauge:.0f}% ({levels})"},
+    "ladder_down": {"en": "GAUGE ALARM: gauge just fell to {gauge:.0f}% ({levels})",
+                    "ar": "تنبيه المؤشر: المؤشر هبط الآن إلى {gauge:.0f}% ({levels})"},
+    "levels_new_one": {"en": "1 new level today", "ar": "مستوى جديد واحد اليوم"},
+    "levels_new_many": {"en": "{n} new levels today", "ar": "{n} مستويات جديدة اليوم"},
+    "meaning": {"en": "Levels like this have meant: 21K moves about {egp} ({pct:+.1f}%) "
+                      "- usually lands within about a day, sometimes within hours [{src}]",
+                "ar": "قراءات كهذه كانت تعني تاريخيًا: 21ك يتحرك نحو {egp} ({pct:+.1f}%) "
+                      "— يصل عادة خلال يوم تقريبًا، وأحيانًا خلال ساعات [{src}]"},
+    "src_rough": {"en": "rough estimate", "ar": "تقدير مبدئي"},
+    "src_measured": {"en": "measured from {n} runs in your log",
+                     "ar": "محسوب من {n} تشغيل في سجلك"},
+    "pace": {"en": "Pace check: the last 24h 21K moved {egp} ({pct:+.2f}%) - {word} "
+                   "the usual pace for this height",
+             "ar": "فحص السرعة: آخر 24 ساعة تحرك 21ك بمقدار {egp} ({pct:+.2f}%) — {word} "
+                   "الوتيرة المعتادة لهذا الارتفاع"},
+    "pace_ahead": {"en": "ahead of", "ar": "أسرع من"},
+    "pace_line": {"en": "in line with", "ar": "في حدود"},
+    "pace_against": {"en": "against", "ar": "عكس"},
+    "sell_title": {"en": "SELL WINDOW: 21K {price:,.0f} is {delta:+,.0f} EGP "
+                         "({pct:+.2f}%) above {src}",
+                   "ar": "فرصة بيع: سعر 21ك {price:,.0f} أعلى من {src} "
+                         "بمقدار {delta:+,.0f} جنيه ({pct:+.2f}%)"},
+    "sell_src_today": {"en": "today's average", "ar": "متوسط اليوم"},
+    "sell_src_yday": {"en": "yesterday's average (outliers trimmed)",
+                      "ar": "متوسط الأمس (بعد استبعاد القيم الشاذة)"},
+    "sell_body": {"en": "Local spikes like this are often short-lived - if you were "
+                        "planning to sell, this is the kind of moment.",
+                  "ar": "قفزات كهذه غالبًا لا تدوم طويلًا — إذا كنت تنوي البيع "
+                        "فهذا من لحظاتها المناسبة."},
+    "sell_high": {"en": "New 7-day high.", "ar": "أعلى سعر في 7 أيام."},
+    "report_alarms": {"en": "Alarm score: {hits} of {n} recent alarms on target",
+                      "ar": "تقييم التنبيهات: {hits} من {n} من التنبيهات الحديثة على الهدف"},
+    "report_sell": {"en": "Sell windows: {hits} of {n} would have beat waiting 24h",
+                    "ar": "نوافذ البيع: {hits} من {n} كانت ستتفوق على الانتظار 24 ساعة"},
+    "digest_daily": {"en": "Daily digest - {date} ({n} runs)",
+                     "ar": "ملخص اليوم - {date} ({n} تشغيل)"},
+    "digest_weekly": {"en": "Weekly digest - {a} -> {b} ({n} runs)",
+                      "ar": "ملخص الأسبوع - {a} إلى {b} ({n} تشغيل)"},
+    "digest_monthly": {"en": "Monthly digest - {month} ({n} runs)",
+                       "ar": "ملخص الشهر - {month} ({n} تشغيل)"},
+    "dg_gauge": {"en": "- gauge: open {a:.0f}% -> close {b:.0f}% (low {l:.0f}, high {h:.0f})",
+                 "ar": "- المؤشر: افتتاح {a:.0f}% → إغلاق {b:.0f}% (أدنى {l:.0f}، أعلى {h:.0f})"},
+    "dg_direction": {"en": "- direction: {path}", "ar": "- الاتجاه: {path}"},
+    "dg_direction_all": {"en": "- direction: {d} all period",
+                         "ar": "- الاتجاه: {d} طوال الفترة"},
+    "dg_direction_n": {"en": "- direction: {a} -> ... -> {b} ({k} changes)",
+                       "ar": "- الاتجاه: {a} → ... → {b} ({k} تغييرات)"},
+    "dg_21k": {"en": "- 21K: {a:,.0f} -> {b:,.0f} EGP ({d:+,.0f}, {p:+.2f}%)",
+               "ar": "- 21ك: {a:,.0f} → {b:,.0f} جنيه ({d:+,.0f}، {p:+.2f}%)"},
+    "dg_xau": {"en": "- XAU/USD: {a:,.2f} -> {b:,.2f} ({d:+,.2f}, {p:+.2f}%)",
+               "ar": "- الأوقية العالمية: {a:,.2f} → {b:,.2f} ({d:+,.2f}، {p:+.2f}%)"},
+    "dg_div": {"en": "- local-vs-global: {a:+.2f} -> {b:+.2f} pts (max {m:+.2f})",
+               "ar": "- المحلي مقابل العالمي: {a:+.2f} → {b:+.2f} نقطة (الأقصى {m:+.2f})"},
+    "dg_gap": {"en": "- parallel gap: {a:+.2f}% -> {b:+.2f}%",
+               "ar": "- فجوة الدولار الموازي: {a:+.2f}% → {b:+.2f}%"},
+    "dg_bigday": {"en": "- biggest 21K day move: {pct:+.2f}% on {d}",
+                  "ar": "- أكبر حركة يومية لـ21ك: {pct:+.2f}% في {d}"},
+    "dg_grading": {"en": "- grading: {ok}/{n} calls correct",
+                   "ar": "- التقييم: {ok}/{n} من التوقعات صحيحة"},
+    "rightnow": {"en": "Right now:", "ar": "الآن:"},
+    "gauge_line": {"en": "Gold gauge: {pct}% {direction} ({conf})",
+                   "ar": "مؤشر الذهب: {pct}% {direction} (ثقة {conf})"},
+    "change_line": {"en": "Change: {delta} pts since last check",
+                    "ar": "التغير: {delta} نقطة منذ آخر فحص"},
+    "change_dry": {"en": "n/a (dry run)", "ar": "غير متاح (تجربة)"},
+    "change_first": {"en": "first logged run - baseline saved",
+                     "ar": "أول تسجيل — تم حفظ نقطة البداية"},
+    "sig_technical": {"en": "- technical: {detail}", "ar": "- الفني: {detail}"},
+    "sig_consensus": {"en": "- consensus: {detail}", "ar": "- الإجماع العالمي: {detail}"},
+    "sig_news": {"en": "- news: {detail}", "ar": "- الأخبار: {detail}"},
+    "div_line": {"en": "- local-vs-global (7d): 21K {a:+.2f}% | XAU/USD {b:+.2f}% | spread {s:+.2f} pts",
+                  "ar": "- المحلي مقابل العالمي (7 أيام): 21ك {a:+.2f}% | الأوقية {b:+.2f}% | الفارق {s:+.2f} نقطة"},
+    "dir_UP": {"en": "UP", "ar": "صاعد"},
+    "dir_DOWN": {"en": "DOWN", "ar": "هابط"},
+    "dir_FLAT": {"en": "FLAT", "ar": "مستقر"},
+    "conf_strong": {"en": "strong", "ar": "قوية"},
+    "conf_moderate": {"en": "moderate", "ar": "متوسطة"},
+    "conf_low": {"en": "low", "ar": "ضعيفة"},
+    "levels_head": {"en": "Levels (7d): {parts}", "ar": "المستويات (7 أيام): {parts}"},
+    "lvl_target": {"en": "target", "ar": "هدف"},
+    "lvl_support": {"en": "support", "ar": "دعم"},
+    "lvl_resistance": {"en": "resistance", "ar": "مقاومة"},
+    "lvl_gram": {"en": "gram", "ar": "جرام"},
+    "lvl_ounce": {"en": "ounce", "ar": "أوقية"},
+    "lvl_fromnow": {"en": "({d:+.1f}% from now)", "ar": "({d:+.1f}% من الآن)"},
+    "accuracy_both": {"en": "Accuracy: direction {d}% ({dn} UP/DOWN calls) | "
+                            "strict {s}% ({n} graded calls)",
+                      "ar": "الدقة: الاتجاه {d}% ({dn} توقع صاعد/هابط) | "
+                            "الصارمة {s}% ({n} توقع مُقيَّم)"},
+    "accuracy_strict": {"en": "Gauge accuracy ({n} graded calls): {pct}%",
+                        "ar": "دقة المؤشر ({n} توقع مُقيَّم): {pct}%"},
+    "bias": {"en": "Bias gauge, not financial advice.",
+             "ar": "مؤشر استرشادي وليس نصيحة استثمارية."},
+}
+
+
+def T(lang, key, **kw):
+    """Translate one message string; falls back to English, then the key."""
+    entry = TRANSLATIONS.get(key) or {}
+    tmpl = entry.get(lang) or entry.get("en") or key
+    try:
+        return tmpl.format(**kw)
+    except (KeyError, IndexError, ValueError):
+        return tmpl
+
+
+def _dir_word(lang, direction):
+    return T(lang, "dir_" + str(direction)) if direction else "?"
+
+
+def _conf_word(lang, conf):
+    key = "conf_" + str(conf) if conf in ("strong", "moderate", "low") else "conf_low"
+    return T(lang, key)
 
 
 # --------------------------------------------------------------------------- #
@@ -375,7 +611,7 @@ def _num(r, col, name):
         return None
 
 
-def _digest_core(day, col, title):
+def _digest_core(day, col, title, lang="en"):
     """Shared digest body over a list of prediction rows -> lines."""
     out = [title]
 
@@ -384,8 +620,7 @@ def _digest_core(day, col, title):
 
     g = series("final_pct")
     if g:
-        out.append(f"- gauge: open {g[0]:.0f}% -> close {g[-1]:.0f}% "
-                   f"(low {min(g):.0f}, high {max(g):.0f})")
+        out.append(T(lang, "dg_gauge", a=g[0], b=g[-1], l=min(g), h=max(g)))
     path, last_d = [], None
     for r in day:
         d = _val(r, col, "direction")
@@ -394,42 +629,40 @@ def _digest_core(day, col, title):
             path.append(f"{d} {t}" if t else str(d))
             last_d = d
     if len(path) > 6:  # long windows: compress the hops
-        out.append(f"- direction: {path[0]} -> ... -> {path[-1]} "
-                   f"({len(path) - 1} changes)")
+        out.append(T(lang, "dg_direction_n", a=path[0], b=path[-1], k=len(path) - 1))
     elif len(path) > 1:
-        out.append("- direction: " + " -> ".join(path))
+        out.append(T(lang, "dg_direction", path=" -> ".join(path)))
     elif path:
-        out.append(f"- direction: {path[0]} all period")
+        out.append(T(lang, "dg_direction_all", d=path[0]))
     p = series("price_21k")
     if p:
-        out.append(f"- 21K: {p[0]:,.0f} -> {p[-1]:,.0f} EGP "
-                   f"({p[-1] - p[0]:+,.0f}, {(p[-1] - p[0]) / p[0] * 100:+.2f}%)")
+        out.append(T(lang, "dg_21k", a=p[0], b=p[-1], d=p[-1] - p[0],
+                     p=(p[-1] - p[0]) / p[0] * 100))
     x = series("global_xauusd")
     if x:
-        out.append(f"- XAU/USD: {x[0]:,.2f} -> {x[-1]:,.2f} "
-                   f"({x[-1] - x[0]:+,.2f}, {(x[-1] - x[0]) / x[0] * 100:+.2f}%)")
+        out.append(T(lang, "dg_xau", a=x[0], b=x[-1], d=x[-1] - x[0],
+                     p=(x[-1] - x[0]) / x[0] * 100))
     d7 = series("divergence_7d")
     if d7:
-        out.append(f"- local-vs-global: {d7[0]:+.2f} -> {d7[-1]:+.2f} pts "
-                   f"(max {max(d7, key=abs):+.2f})")
+        out.append(T(lang, "dg_div", a=d7[0], b=d7[-1], m=max(d7, key=abs)))
     gp = series("parallel_gap_pct")
     if gp:
-        out.append(f"- parallel gap: {gp[0]:+.2f}% -> {gp[-1]:+.2f}%")
+        out.append(T(lang, "dg_gap", a=gp[0], b=gp[-1]))
     return out
 
 
-def _grading_line(col, rows, want):
+def _grading_line(col, rows, want, lang="en"):
     """want = set of UTC-date prefixes (or a single string) for graded rows."""
     prefixes = {want} if isinstance(want, str) else want
     graded = [r for r in rows
               if (_val(r, col, "graded_at_utc") or "")[:10] in prefixes]
     if graded:
         ok = sum(1 for r in graded if _val(r, col, "predicted_correct") == "1")
-        return f"- grading: {ok}/{len(graded)} calls correct"
+        return T(lang, "dg_grading", ok=ok, n=len(graded))
     return None
 
 
-def _day_move_line(day, col):
+def _day_move_line(day, col, lang="en"):
     """Biggest single-Cairo-day 21K move within the window (weekly/monthly)."""
     per = {}
     for r in day:
@@ -445,7 +678,7 @@ def _day_move_line(day, col):
     if not moves:
         return None
     _, pct, d = max(moves)
-    return f"- biggest 21K day move: {pct:+.2f}% on {d}"
+    return T(lang, "dg_bigday", pct=pct, d=d)
 
 
 def _filter_day(rows, col, dates):
@@ -454,7 +687,7 @@ def _filter_day(rows, col, dates):
             if (_val(r, col, "timestamp_cairo") or "")[:10] in dates]
 
 
-def build_daily_digest():
+def build_daily_digest(lang="en"):
     """Yesterday's runs (Cairo)."""
     col, rows = _load_pred_rows()
     if not rows:
@@ -463,14 +696,15 @@ def build_daily_digest():
     day = _filter_day(rows, col, yest)
     if not day:
         return None
-    out = _digest_core(day, col, f"Daily digest - {yest} ({len(day)} runs)")
-    gl = _grading_line(col, rows, yest)
+    out = _digest_core(day, col,
+                       T(lang, "digest_daily", date=yest, n=len(day)), lang)
+    gl = _grading_line(col, rows, yest, lang)
     if gl:
         out.append(gl)
     return out
 
 
-def build_weekly_digest():
+def build_weekly_digest(lang="en"):
     """Rolling last-7-Cairo-days window ending yesterday."""
     col, rows = _load_pred_rows()
     if not rows:
@@ -481,18 +715,18 @@ def build_weekly_digest():
     if not day:
         return None
     out = _digest_core(day, col,
-                       f"Weekly digest - {min(dates)} -> {max(dates)} "
-                       f"({len(day)} runs)")
-    mv = _day_move_line(day, col)
+                       T(lang, "digest_weekly", a=min(dates), b=max(dates),
+                         n=len(day)), lang)
+    mv = _day_move_line(day, col, lang)
     if mv:
         out.append(mv)
-    gl = _grading_line(col, rows, dates)
+    gl = _grading_line(col, rows, dates, lang)
     if gl:
         out.append(gl)
     return out
 
 
-def build_monthly_digest():
+def build_monthly_digest(lang="en"):
     """The previous calendar Cairo month."""
     col, rows = _load_pred_rows()
     if not rows:
@@ -505,16 +739,16 @@ def build_monthly_digest():
     if not day:
         return None
     out = _digest_core(day, col,
-                       f"Monthly digest - {prev_end.strftime('%B %Y')} "
-                       f"({len(day)} runs)")
-    mv = _day_move_line(day, col)
+                       T(lang, "digest_monthly",
+                         month=prev_end.strftime("%B %Y"), n=len(day)), lang)
+    mv = _day_move_line(day, col, lang)
     if mv:
         out.append(mv)
     graded = [r for r in rows
               if (_val(r, col, "graded_at_utc") or "").startswith(ym)]
     if graded:
         ok = sum(1 for r in graded if _val(r, col, "predicted_correct") == "1")
-        out.append(f"- grading: {ok}/{len(graded)} calls correct")
+        out.append(T(lang, "dg_grading", ok=ok, n=len(graded)))
     return out
 
 
@@ -568,66 +802,309 @@ def _gauge_move_stats(pts):
     return {z: (sum(v) / len(v), len(v)) for z, v in buckets.items()}
 
 
-def _ladder_meaning(rung, stats, price):
+def _ladder_meaning(rung, stats, price, lang="en"):
     """(pct, egp, source): what a ladder height has meant for 21K next day."""
     if rung in stats and stats[rung][1] >= 3:
         pct, n = stats[rung]
-        src = f"measured from {n} runs in your log"
+        src = T(lang, "src_measured", n=n)
     else:
         pct = LADDER_EST.get(rung, 0.0)
-        src = "rough estimate"
+        src = T(lang, "src_rough")
     egp = pct / 100.0 * price if price else None
     return pct, egp, src
 
 
-def detect_gauge_alarm(verbose=False):
-    """Ring when the gauge reaches a height it has not touched today.
+# --------------------------------------------------------------------------- #
+# Alarms log (data/alarms.csv): every alarm + its later report card
+# --------------------------------------------------------------------------- #
+def _load_alarms():
+    if not os.path.exists(ALARMS_PATH):
+        return []
+    with open(ALARMS_PATH, newline="", encoding="utf-8") as fh:
+        rows = [r for r in csv.reader(fh) if r]
+    if len(rows) < 2:
+        return []
+    col = {name: i for i, name in enumerate(rows[0])}
+    return [{k: (r[i] if i < len(r) else "") for k, i in col.items()}
+            for r in rows[1:]]
 
-    Ladder: 58 / 65 / 72 / 80 / 90 climbing, 42 / 35 / 28 / 20 / 10 falling.
-    A rung rings ONCE per Cairo day, on the run it is first crossed, and the
-    message translates the height into the 21K move that height has meant
-    (measured from your own log once it has >=3 samples at that height,
-    rough by-design estimate before that).
-    verbose=True (--dry-run) also reports a quiet ladder.
+
+def _alarms_rung_today(kind):
+    """Details of `kind` alarms already raised today (Cairo) - for dedup."""
+    today = cairo_now().strftime("%Y-%m-%d")
+    return {a.get("detail") for a in _load_alarms()
+            if a.get("kind") == kind
+            and (a.get("timestamp_cairo") or "")[:10] == today}
+
+
+def _append_alarm(kind, detail, est_pct, price, persist=True):
+    """Log one alarm. persist=False in dry-run (preview only, no file)."""
+    if not persist:
+        return
+    append_row(ALARMS_PATH, ALARMS_HEADER, {
+        "timestamp_utc": now_utc_str(),
+        "timestamp_cairo": cairo_now().strftime("%Y-%m-%d %H:%M:%S"),
+        "kind": kind, "detail": detail,
+        "est_pct": (f"{est_pct:+.2f}" if est_pct is not None else ""),
+        "price": (f"{price:.0f}" if price else ""),
+        "graded": "", "actual_pct": "", "verdict": ""})
+
+
+def _grade_alarms():
+    """Fill verdicts on alarms old enough to judge (21-36h later price).
+
+    gauge alarms:  hit = the real move reached >= half the promised move,
+                   same direction (ALARM_HIT_FRACTION).
+    milestones:    beat = selling at the flag beat holding for 24h
+                   (price afterwards fell back below the flagged price).
+    """
+    if not os.path.exists(ALARMS_PATH):
+        return
+    series = _main_price_series() if os.path.exists(CSV_PATH) else []
+    if len(series) < 2:
+        return
+    with open(ALARMS_PATH, newline="", encoding="utf-8") as fh:
+        rows = list(csv.reader(fh))
+    if len(rows) < 2:
+        return
+    col = {name: i for i, name in enumerate(rows[0])}
+    now = datetime.now(timezone.utc)
+    changed = False
+    for r in rows[1:]:
+        if col["graded"] < len(r) and r[col["graded"]]:
+            continue
+        try:
+            ts = datetime.strptime(r[col["timestamp_utc"]],
+                                   "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            price = float(r[col["price"]])
+        except (ValueError, IndexError, TypeError):
+            continue
+        age_h = (now - ts).total_seconds() / 3600.0
+        if age_h < 21:
+            continue
+        future = next((p for t, p in series
+                       if 21.0 <= (t - ts).total_seconds() / 3600.0 <= 36.0), None)
+        if future is None:
+            if age_h > 48:  # window passed with no price -> close it out
+                r[col["graded"]] = "1"
+                r[col["verdict"]] = "n/a"
+                changed = True
+            continue
+        try:
+            est = float(r[col["est_pct"]]) if r[col["est_pct"]] else None
+        except ValueError:
+            est = None
+        actual = (future - price) / price * 100.0
+        kind = r[col["kind"]]
+        if kind == "milestone":
+            verdict = "beat" if actual < 0 else "held"
+        elif est is None or abs(est) < 1e-9:
+            verdict = "n/a"
+        else:
+            need = ALARM_HIT_FRACTION * est
+            verdict = "hit" if (actual >= need if est > 0 else actual <= need) else "miss"
+        r[col["graded"]] = "1"
+        r[col["actual_pct"]] = f"{actual:+.2f}"
+        r[col["verdict"]] = verdict
+        changed = True
+    if changed:
+        with open(ALARMS_PATH, "w", newline="", encoding="utf-8") as fh:
+            csv.writer(fh).writerows(rows)
+
+
+def alarm_report_lines(lang="en"):
+    """Report card over the last 5 graded alarms of each kind."""
+    alarms = [a for a in _load_alarms() if a.get("graded") == "1"]
+    out = []
+    ga = [a for a in alarms if a.get("kind") == "gauge"][-5:]
+    if ga:
+        hits = sum(1 for a in ga if a.get("verdict") == "hit")
+        out.append(T(lang, "report_alarms", hits=hits, n=len(ga)))
+    ms = [a for a in alarms if a.get("kind") == "milestone"][-5:]
+    if ms:
+        beats = sum(1 for a in ms if a.get("verdict") == "beat")
+        out.append(T(lang, "report_sell", hits=beats, n=len(ms)))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Gauge ladder alarm (fresh: the current run counts; anti-twitch confirmed)
+# --------------------------------------------------------------------------- #
+def _nearest_price(series, target, tol_hours=6.0):
+    """Price logged nearest to `target` time (±tol) from [(dt, price)] or None."""
+    best = None
+    for ts, price in series:
+        if price is None:
+            continue
+        d = abs((ts - target).total_seconds())
+        if d <= tol_hours * 3600 and (best is None or d < best[0]):
+            best = (d, price)
+    return best[1] if best else None
+
+
+def _pace_note(pts, current_price, est_pct, lang="en"):
+    """Speed-aware line: what the last 24h actually did vs the usual pace."""
+    if current_price is None or len(pts) < 2:
+        return None
+    base = _nearest_price([(t, p) for t, _, p in pts],
+                          pts[-1][0] - timedelta(hours=24), 6.0)
+    if not base:
+        return None
+    pct = (current_price - base) / base * 100.0
+    if est_pct and (pct > 0) != (est_pct > 0):
+        word = "pace_against"
+    elif abs(pct) > 1.5 * abs(est_pct or 0.0):
+        word = "pace_ahead"
+    else:
+        word = "pace_line"
+    return T(lang, "pace", egp=f"{current_price - base:+,.0f} EGP", pct=pct,
+             word=T(lang, word))
+
+
+def detect_gauge_alarm(current_gauge, current_price, persist=True):
+    """Ring when the gauge reaches a rung not yet rung today (Cairo).
+
+    FRESH: the CURRENT run's gauge participates directly, so the alarm
+    describes the run it fires in (no more one-run lag).
+    ANTI-TWITCH: a crossing rings instantly only when it clears the rung by
+    LADDER_CONFIRM pts; a weaker crossing rings once the gauge has held the
+    rung for two consecutive runs. 0 = every crossing rings instantly.
+    Dedup lives in data/alarms.csv (survives restarts, once per rung/day).
+    Returns a dict for the renderer, or None when quiet.
     """
     col, rows = _load_pred_rows()
-    if not rows:
-        return []
-    pts = _ladder_points(col, rows)
-    if len(pts) < 2:
-        return []
-    today = cairo_now().date()
-    last_ts, last_g, last_p = pts[-1]
-    prev_g = pts[-2][1]
+    pts = _ladder_points(col, rows) if rows else []
+    prev_g = pts[-1][1] if pts else None
+    prev_prev_g = pts[-2][1] if len(pts) > 1 else None
+    rung_today = _alarms_rung_today("gauge")
 
-    def reached_earlier_today(gauge, side):
-        return any(t.date() == today and
-                   (g >= gauge if side == "up" else g <= gauge)
-                   for t, g, _ in pts[:-2])
+    def rings_up(r):
+        if f"up:{r}" in rung_today or current_gauge < r:
+            return False
+        if prev_g is None:
+            return False
+        if prev_g < r:  # fresh crossing this run
+            return LADDER_CONFIRM <= 0 or current_gauge >= r + LADDER_CONFIRM
+        # held: crossed earlier (unconfirmed), now a second run above it
+        return current_gauge >= r and (prev_prev_g is None or prev_prev_g < r)
 
-    new_up = [r for r in LADDER_UP
-              if prev_g < r <= last_g and not reached_earlier_today(r, "up")]
-    new_down = [r for r in LADDER_DOWN
-                if prev_g > r >= last_g and not reached_earlier_today(r, "down")]
+    def rings_down(r):
+        if f"down:{r}" in rung_today or current_gauge > r:
+            return False
+        if prev_g is None:
+            return False
+        if prev_g > r:  # fresh crossing this run
+            return LADDER_CONFIRM <= 0 or current_gauge <= r - LADDER_CONFIRM
+        return current_gauge <= r and (prev_prev_g is None or prev_prev_g > r)
+
+    new_up = [r for r in LADDER_UP if rings_up(r)]
+    new_down = [r for r in LADDER_DOWN if rings_down(r)]
     if not new_up and not new_down:
-        if verbose:
-            todays = [g for t, g, _ in pts if t.date() == today]
-            extra = (f" (highest so far today: {max(todays):.0f})"
-                     if todays else "")
-            return [f"(ladder) gauge {last_g:.0f}% - no new level today{extra}"]
-        return []
+        return None
 
     if new_up:
-        rung, word = max(new_up), "climbed to"
+        side, rung = "up", max(new_up)
     else:
-        rung, word = min(new_down), "fell to"
-    pct, egp, src = _ladder_meaning(rung, _gauge_move_stats(pts), last_p)
-    amount = f"{egp:+,.0f} EGP " if egp is not None else ""
-    levels = len(new_up or new_down)
-    return [f"GAUGE ALARM: gauge {word} {last_g:.0f}% "
-            f"({levels} new level{'s' if levels > 1 else ''} today)",
-            f"Heights like this have meant: 21K next day about "
-            f"{amount}({pct:+.1f}%) [{src}]"]
+        side, rung = "down", min(new_down)
+    est_pct, egp, src = _ladder_meaning(rung, _gauge_move_stats(pts),
+                                        current_price)
+    for r in (new_up if new_up else new_down):
+        _append_alarm("gauge", f"{side}:{r}", LADDER_EST.get(r, 0.0),
+                      current_price, persist)
+    res = {"side": side, "rung": rung, "levels": len(new_up or new_down),
+           "gauge": current_gauge, "est_pct": est_pct, "egp": egp, "src": src}
+    pace = _pace_note(pts, current_price, est_pct)
+    if pace:
+        res["pace"] = pace
+    return res
+
+
+def render_alarm(res, lang="en"):
+    """Alarm dict -> message lines (localized)."""
+    if not res:
+        return []
+    levels_txt = (T(lang, "levels_new_one") if res["levels"] == 1
+                  else T(lang, "levels_new_many", n=res["levels"]))
+    lines = [T(lang, "ladder_up" if res["side"] == "up" else "ladder_down",
+               gauge=res["gauge"], levels=levels_txt)]
+    if res.get("egp") is not None:
+        lines.append(T(lang, "meaning", egp=f"{res['egp']:+,.0f} EGP",
+                       pct=res["est_pct"], src=res["src"]))
+    if res.get("pace"):
+        lines.append(res["pace"])
+    return lines
+
+
+# --------------------------------------------------------------------------- #
+# SELL WINDOW milestone: 21K far above the day's average = local sell chance
+# --------------------------------------------------------------------------- #
+def _trimmed_mean(vals, tol=0.02):
+    """Mean after dropping prices that sit >tol away from the median."""
+    if not vals:
+        return None
+    med = sorted(vals)[len(vals) // 2]
+    keep = [v for v in vals if med and abs(v - med) / med <= tol]
+    use = keep or vals
+    return sum(use) / len(use)
+
+
+def detect_milestone(current_price, persist=True):
+    """SELL WINDOW when 21K rises MILESTONE_PCT (or MILESTONE_EGP) above the
+    day's average price. Baseline = today's mean once MILESTONE_MIN_RUNS runs
+    exist today; before that, yesterday's outlier-trimmed mean. Rings once
+    per Cairo day. Returns a dict for the renderer, or None."""
+    if current_price is None:
+        return None
+    if "milestone" in _alarms_rung_today("milestone"):
+        return None
+    col, rows = _load_pred_rows()
+
+    def day_prices(d):
+        if not rows:
+            return []
+        return [v for r in rows
+                if (_val(r, col, "timestamp_cairo") or "")[:10] == d
+                for v in [_num(r, col, "price_21k")] if v is not None]
+
+    today = cairo_now().strftime("%Y-%m-%d")
+    yest = (cairo_now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    todays = day_prices(today)
+    if len(todays) >= MILESTONE_MIN_RUNS:
+        baseline, src_key = sum(todays) / len(todays), "sell_src_today"
+    else:
+        baseline = _trimmed_mean(day_prices(yest))
+        src_key = "sell_src_yday"
+        if baseline is None:
+            if not todays:
+                return None
+            baseline, src_key = sum(todays) / len(todays), "sell_src_today"
+    delta = current_price - baseline
+    pct = delta / baseline * 100.0 if baseline else 0.0
+    if not (pct >= MILESTONE_PCT or (MILESTONE_EGP > 0 and delta >= MILESTONE_EGP)):
+        return None
+    high7 = False
+    try:
+        series = _main_price_series()
+        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        past = [p for t, p in series if t >= cutoff]
+        high7 = bool(past) and current_price > max(past)
+    except Exception:  # noqa: BLE001 - the high note is cosmetic
+        pass
+    _append_alarm("milestone", "milestone", round(pct, 2), current_price, persist)
+    return {"price": current_price, "baseline": baseline, "delta": delta,
+            "pct": pct, "src_key": src_key, "high7": high7}
+
+
+def render_milestone(res, lang="en"):
+    """Milestone dict -> message lines (localized)."""
+    if not res:
+        return []
+    lines = [T(lang, "sell_title", price=res["price"], delta=res["delta"],
+               pct=res["pct"], src=T(lang, res["src_key"])),
+             T(lang, "sell_body")]
+    if res.get("high7"):
+        lines.append(T(lang, "sell_high"))
+    return lines
 
 
 # --------------------------------------------------------------------------- #
@@ -662,28 +1139,31 @@ def main():
     accuracy = None if args.dry_run else grade_pending()
     if not args.dry_run:
         migrate_pred_csv()
+        try:
+            _grade_alarms()  # report card: grade alarms now 21-36h old
+        except Exception as err:  # noqa: BLE001
+            print(f"  [alarms] grading failed: {err}", file=sys.stderr)
 
-    # current 21K price for level distances
+    # current 21K price for level distances / alarms
     current_21k = None
     for g in groups:
         if g["group"] == "technical" and g.get("indicators", {}).get("column") == "gold_21k_sell":
             current_21k = g["indicators"].get("last")
 
-    if delta is not None:
-        change_txt = f"{delta:+.0f} pts since last check"
-    elif args.dry_run:
-        change_txt = "n/a (dry run)"
-    else:
-        change_txt = "first logged run - baseline saved"
-    lines = [f"Gold gauge: {pct}% {direction} ({conf})",
-             f"Change: {change_txt}"]
-    for g in groups:
-        lines.append(f"- {g['group']}: {fmt_sign(g['score'])} ({g['detail']})")
+    # ---- alarms: FRESH (current run counts) + anti-twitch + milestone ----
+    try:
+        alarm_res = detect_gauge_alarm(pct, current_21k, persist=not args.dry_run)
+    except Exception as err:  # noqa: BLE001
+        print(f"  [ladder] check failed: {err}", file=sys.stderr)
+        alarm_res = None
+    try:
+        mile_res = detect_milestone(current_21k, persist=not args.dry_run)
+    except Exception as err:  # noqa: BLE001
+        print(f"  [milestone] check failed: {err}", file=sys.stderr)
+        mile_res = None
 
     # Local-vs-global divergence: Egyptian prices = global gold x USD/EGP x
-    # local premium. A persistent spread means local market forces (merchant
-    # hoarding, supply, EGP moves) are dominating. Measured + logged first;
-    # it can earn a weight later once we have ~2 weeks of data.
+    # local premium. A persistent spread means local market forces dominate.
     tech_g = next((g for g in groups if g["group"] == "technical"), None)
     cons_g = next((g for g in groups if g["group"] == "consensus"), None)
     local_7d = (tech_g or {}).get("indicators", {}).get("mom_7d_pct")
@@ -692,31 +1172,15 @@ def main():
     divergence = None
     if isinstance(local_7d, (int, float)) and isinstance(global_7d, (int, float)):
         divergence = round(local_7d - global_7d, 3)
-        lines.append(f"- local-vs-global (7d): 21K {local_7d:+.2f}% | "
-                     f"XAU/USD {global_7d:+.2f}% | spread {divergence:+.2f} pts")
 
-    # Local premium monitor: the source site bakes parallel-dollar stress,
-    # making charges and scarcity premiums into its USD/EGP rate - invisible
-    # inside its own numbers. Measure the invisible against external
-    # references: official-FX gap, your real souq reports, formula-break
-    # alarm. Fail-soft: any problem here never blocks the gauge.
+    # Local premium monitor: measures the parallel-dollar stress the source
+    # site bakes into its own USD/EGP rate. Fail-soft: never blocks the gauge.
     prem = None
     try:
-        prem = local_premium.measure(CSV_PATH, PRED_PATH)
+        prem = local_premium.measure(CSV_PATH, PRED_PATH)  # EN; CSV columns too
     except Exception as err:  # noqa: BLE001
         print(f"  [premium] monitor failed: {err}", file=sys.stderr)
-    if prem:
-        lines.extend(prem["lines"])
-    level_parts = summarize_levels(current_21k)  # read-only, safe in dry-run too
-    if level_parts:
-        lines.append("Levels (7d): " + " | ".join(level_parts))
-    if accuracy:
-        lines.append(f"Gauge accuracy ({accuracy['n']} graded calls): {accuracy['pct']}%")
-    lines.append("Bias gauge, not financial advice.")
 
-    # Morning digests: daily every Cairo day; weekly rides on DIGEST_WEEKDAY
-    # (default Saturday = 5), monthly on the 1st - all inside the ONE morning
-    # message. Dry-run previews whatever would fire today (read-only).
     def _safe(fn):
         try:
             return fn()
@@ -725,32 +1189,86 @@ def main():
                   file=sys.stderr)
             return None
 
-    # Gauge-ladder alarm: rings when the gauge reaches a height it has not
-    # touched today, and says what 21K move that height has meant.
-    try:
-        alarms = detect_gauge_alarm(verbose=args.dry_run)
-    except Exception as err:  # noqa: BLE001
-        print(f"  [ladder] check failed: {err}", file=sys.stderr)
-        alarms = []
+    def _prem_lines(lang):
+        """Premium monitor lines in a language (EN reused from the first call)."""
+        if not prem:
+            return []
+        if lang == "en":
+            return prem.get("lines", [])
+        try:
+            return local_premium.measure(CSV_PATH, PRED_PATH, lang=lang).get("lines", [])
+        except Exception:  # noqa: BLE001
+            return prem.get("lines", [])
 
-    head = []
-    if alarms:
-        head += alarms + [""]
-    if args.dry_run or new_day:
-        parts = [_safe(build_daily_digest)]
-        if cairo_now().weekday() == DIGEST_WEEKDAY:
-            parts.append(_safe(build_weekly_digest))
-        if cairo_now().day == 1:
-            parts.append(_safe(build_monthly_digest))
-        for part in parts:
-            if part:
-                head += part + [""]
-    if head:
-        head[-1] = "Right now:"
-        lines = head + lines
+    # ---- which languages do the recipients need? ----
+    need_langs = set()
+    for _, lang in _recipients():
+        need_langs |= {"en", "ar"} if lang == "both" else {lang}
+    if args.dry_run or not need_langs:
+        need_langs = {"en"}
 
-    message = "\n".join(lines)
-    print(message)
+    def _compose(lang):
+        """The full message for one language: blocks joined by a blank line."""
+        blocks = []
+        if alarm_res:
+            blocks.append(render_alarm(alarm_res, lang))
+        if mile_res:
+            blocks.append(render_milestone(mile_res, lang))
+        if not args.dry_run:
+            rep = alarm_report_lines(lang)
+            if rep:
+                blocks.append(rep)
+        if args.dry_run or new_day:
+            parts = [_safe(lambda: build_daily_digest(lang))]
+            if cairo_now().weekday() == DIGEST_WEEKDAY:
+                parts.append(_safe(lambda: build_weekly_digest(lang)))
+            if cairo_now().day == 1:
+                parts.append(_safe(lambda: build_monthly_digest(lang)))
+            for part in parts:
+                if part:
+                    blocks.append(part)
+        if delta is not None:
+            change_txt = T(lang, "change_line", delta=f"{delta:+.0f}")
+        elif args.dry_run:
+            change_txt = T(lang, "change_dry")
+        else:
+            change_txt = T(lang, "change_first")
+        blocks.append([T(lang, "rightnow"),
+                       T(lang, "gauge_line", pct=pct,
+                         direction=_dir_word(lang, direction),
+                         conf=_conf_word(lang, conf)),
+                       change_txt])
+        sig = [T(lang, "sig_" + g["group"], detail=g["detail"])
+               for g in groups if g["group"] in ("technical", "consensus", "news")]
+        if divergence is not None:
+            sig.append(T(lang, "div_line", a=local_7d, b=global_7d, s=divergence))
+        if sig:
+            blocks.append(sig)
+        pl = _prem_lines(lang)
+        if pl:
+            blocks.append(pl)
+        tail = []
+        level_parts = summarize_levels(current_21k, lang)  # read-only, dry-run safe
+        if level_parts:
+            tail.append(T(lang, "levels_head", parts=" | ".join(level_parts)))
+        if accuracy:
+            if accuracy.get("dir_n"):
+                tail.append(T(lang, "accuracy_both", d=accuracy["dir_pct"],
+                              dn=accuracy["dir_n"], s=accuracy["pct"],
+                              n=accuracy["n"]))
+            else:
+                tail.append(T(lang, "accuracy_strict", n=accuracy["n"],
+                              pct=accuracy["pct"]))
+        tail.append(T(lang, "bias"))
+        blocks.append(tail)
+        return "\n\n".join("\n".join(b) for b in blocks if b)
+
+    messages = {lang: _compose(lang) for lang in sorted(need_langs)}
+    print(messages.get("en") or next(iter(messages.values()), ""))
+    if args.dry_run and not alarm_res:
+        print("  [ladder] quiet - no new rung today", file=sys.stderr)
+    if args.dry_run and not mile_res:
+        print("  [milestone] quiet - price not above the day baseline", file=sys.stderr)
     if args.json:
         print(json.dumps({"pct": pct, "direction": direction, "confidence": conf,
                           "groups": groups, "accuracy": accuracy}, ensure_ascii=False))
@@ -789,10 +1307,10 @@ def main():
     should_notify = bool(args.force or prev is None or new_day
                          or prev_dir != direction
                          or (delta is not None and abs(delta) >= NOTIFY_DELTA)
-                         or alarms)
+                         or alarm_res or mile_res)
     if should_notify:
         try:
-            send_telegram(message)
+            send_telegram(messages)
         except Exception as err:  # noqa: BLE001 - never fail the run on notify
             print(f"  [telegram] ERROR: {err}", file=sys.stderr)
     else:
