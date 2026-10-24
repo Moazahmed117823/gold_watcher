@@ -503,6 +503,21 @@ def _llm_gap(min_gap=4.0):
     globals()["_last_llm_ts"] = time.time()
 
 
+def _llm_extra():
+    """Provider/model-specific request extras (kept conservative).
+
+    gpt-oss models are reasoning models: with a small max_tokens they can
+    spend everything on internal reasoning and return EMPTY content, which
+    Groq reports as json_validate_failed. Lowering reasoning effort and
+    raising the budget fixes that. Only applied to gpt-oss / Groq so other
+    OpenAI-protocol providers are unaffected.
+    """
+    cfg = _llm_cfg()
+    if "gpt-oss" in cfg["model"].lower() or "groq" in cfg["base"].lower():
+        return {"reasoning_effort": "low"}
+    return {}
+
+
 def call_agent_raw(messages, max_tokens=1800, retries=3):
     """Send a message list to the LLM agent. Returns parsed dict | None."""
     cfg = _llm_cfg()
@@ -515,6 +530,7 @@ def call_agent_raw(messages, max_tokens=1800, retries=3):
         "max_tokens": max_tokens,
         "response_format": {"type": "json_object"},
     }
+    payload.update(_llm_extra())
     headers = {"Authorization": f"Bearer {cfg['key']}"}
     resp = None
     for attempt in range(1, retries + 1):
@@ -970,7 +986,7 @@ def code_patch_section(decisions):
     ]
     reply = None
     for rnd in range(PATCH_MAX_ROUNDS):
-        reply = call_agent_raw(messages, max_tokens=1400)
+        reply = call_agent_raw(messages, max_tokens=3000)
         if reply is None:
             break
         if (isinstance(reply.get("more"), dict)
