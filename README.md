@@ -179,5 +179,9 @@ find/replace fixes. The runner enforces hard rails:
 Set the workflow env `ALLOW_CODE_PATCH: '0'` to switch the code-patch phase
 off while keeping tuning + reports.
 
+**Test drill**: Actions tab -> Daily AI Review -> Run workflow -> fill the
+`force_code_review` input (e.g. `real_prices.py`) to force the agent through
+the full patch pipeline (it still decides freely; all rails apply).
+
 Manual test: Actions tab -> **Daily AI Review** -> Run workflow
 (locally: `python daily_agent.py --digest` to just print the digest).

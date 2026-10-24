@@ -872,6 +872,36 @@ def log_patch(status, files, blocks, changed, commit, why, detail):
                     changed, commit, (why or "")[:300], (detail or "")[:300]])
 
 
+def maybe_force_review(decisions):
+    """FORCED TEST DRILL: inject a code-review request via environment.
+
+    FORCE_CODE_REVIEW="file.py[,file2.py]" (must be in PATCH_FILES) and
+    FORCE_FOCUS=<keyword> let you drill the whole code-patch pipeline from
+    the Actions tab without waiting for a real bug. The agent still decides
+    freely and every runner rail (allowlist, scan, exact-match, compile,
+    import, rollback) still applies.
+    """
+    forced = os.environ.get("FORCE_CODE_REVIEW", "").strip()
+    if not forced or not isinstance(decisions, dict):
+        return decisions
+    files = [f.strip() for f in forced.split(",")
+             if f.strip() in PATCH_FILES]
+    if not files:
+        print(f"  [patch] FORCE_CODE_REVIEW={forced!r}: no allowlisted files")
+        return decisions
+    decisions["code_review"] = {
+        "files": files,
+        "focus": os.environ.get("FORCE_FOCUS", "").strip() or "def ",
+        "why": "FORCED TEST DRILL (requested by the maintainer) - verify "
+               "the code-patch pipeline end to end. Inspect the region and "
+               "fix a real small issue if you can see one; a tiny guard or "
+               "docstring is acceptable. If nothing warrants a change, "
+               "return an empty patch. All runner rails still apply.",
+    }
+    print(f"  [patch] FORCED test drill on {files}")
+    return decisions
+
+
 def code_patch_section(decisions):
     """Multi-turn code review. Returns a summary dict for the report."""
     req = decisions.get("code_review") if isinstance(decisions, dict) else None
@@ -1088,6 +1118,7 @@ def main():
     patch_res = None
     if decisions and not args.no_llm:
         try:
+            decisions = maybe_force_review(decisions)
             patch_res = code_patch_section(decisions)
         except Exception:  # noqa: BLE001
             traceback.print_exc()
