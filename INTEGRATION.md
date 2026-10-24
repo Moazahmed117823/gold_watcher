@@ -4,7 +4,9 @@ Version: **v11** (2026-10-22) — adds the **SELL WINDOW milestone** (price spik
 above the day's average = local chance to sell), **fresh anti-twitch alarms**,
 the **alarm report card**, **dual accuracy**, an **hourly native schedule**,
 **blank-line message structure**, and **multi-recipient Telegram with an
-Arabic language option**.
+Arabic language option**. **v11.1** (2026-10-24) adds **self-service
+subscribers**: anyone who presses START on the bot picks English or Arabic
+and then gets every report automatically — no GitHub access needed.
 
 Time needed: ~5 minutes. All files in this folder go into your repo root
 (the same level as `scraper.py`).
@@ -242,6 +244,42 @@ TELEGRAM_CHAT_ID = "111222333:ar, 444555666"
   `,<their_id>:ar` to the secret value - no code, no workflow change
 - your existing single chat id keeps working exactly as before
 
+### Self-service subscribers (v11.1) — the friend flow, zero GitHub
+
+The env list above still works, but nobody needs to touch it anymore. Each
+hourly run also checks the bot's Telegram inbox first:
+
+1. a person opens the bot and presses START → the bot replies with a welcome
+   and two buttons: English / العربية
+2. they tap one → their chat is saved to `data/subscribers.csv` (committed
+   automatically next to the price data) and every future report arrives in
+   their language
+3. `/en` and `/ar` switch language anytime, `/latest` replays the newest
+   gauge reading, `/stop` unsubscribes (any other text gets a hint + the
+   buttons again)
+
+The welcome arrives within an hour at most (the bot listens once per hourly
+run). The daily agent's EN/AR review reaches subscribers too.
+
+Make the bot look right in Telegram via **@BotFather** (in your own chat
+with BotFather, not the bot's chat):
+
+1. `/setdescription` → select your bot → paste:
+   `Egyptian gold gauge: an hourly 0-100 meter for where 21K gold is heading, with buy/sell alarms. Press START — your welcome and first report arrive within the hour. English & العربية.`
+2. `/setabouttext` → `Hourly Egypt 21K gold gauge + alarms. Not financial advice.`
+3. `/setcommands` → paste the list:
+   ```
+   start - Subscribe to the gold reports
+   en - Reports in English
+   ar - التقارير بالعربية
+   stop - Unsubscribe
+   latest - Latest gauge reading
+   ```
+
+Warning: never set a **webhook** for this bot — a webhook and the inbox
+check are mutually exclusive in Telegram, and a webhook would silently
+break onboarding. None exists by default; just don't add one.
+
 The Arabic version is a full translation of the message structure (gauge,
 alarms, sell window, digests, levels, accuracy, disclaimer). Indicator
 details (SMA/RSI numbers, article counts) stay in English on purpose -
@@ -409,6 +447,9 @@ to `15`.
 - `data/levels_history.csv` — every verified analyst price level
 - `data/alarms.csv` — every ladder alarm and sell window, with the later
   report-card verdict (this is what feeds `Alarm score:`)
+- `data/subscribers.csv` — self-service subscribers (chat id, language,
+  name, joined, active); written by telegram_bot.py, merged into the
+  recipient list on every run
 - `data/real_prices.csv` — your logged souq prices (via `real_prices.py`)
 
 All are plain CSV; delete them anytime to reset the gauge's memory.

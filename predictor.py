@@ -21,6 +21,9 @@ v11 additions:
   - Dual accuracy: direction-only accuracy shown next to the strict one.
   - Honest window wording + pace note (24h speed vs the usual pace).
   - Multi-recipient Telegram with per-recipient language (English/Arabic).
+  - Self-service subscribers: anyone can /start the bot, pick English or
+    Arabic, and get every report - the maintainer touches nothing
+    (telegram_bot.py; data/subscribers.csv).
 
 Files written (all committed by the workflow):
     data/predictions.csv     one row per run + grading columns
@@ -483,6 +486,14 @@ def _recipients():
         cid = cid.strip()
         if cid:
             out.append((cid, lang))
+    # self-service subscribers (v11.1): merge data/subscribers.csv rows;
+    # env entries keep priority on chat-id conflicts. Fail-soft: onboarding
+    # problems can never break the report pipeline.
+    try:
+        import telegram_bot
+        out = telegram_bot.merge_recipients(out)
+    except Exception as err:  # noqa: BLE001
+        print(f"  [telegram] subscriber merge skipped: {err}", file=sys.stderr)
     return out
 
 
@@ -1169,6 +1180,16 @@ def main():
     ap.add_argument("--force", action="store_true", help="always send the Telegram message")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
+
+    # ---- self-service onboarding: /start, /en, /ar, /stop, /latest ----
+    if not args.dry_run:
+        try:
+            import telegram_bot
+            n = telegram_bot.poll_once()
+            if n:
+                print(f"  [bot] {n} onboarding update(s) processed")
+        except Exception as err:  # noqa: BLE001 - never block the gauge
+            print(f"  [bot] poll skipped: {err}", file=sys.stderr)
 
     groups = collect_signals()
     if not groups:
