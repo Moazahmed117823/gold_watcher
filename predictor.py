@@ -56,6 +56,7 @@ CSV_PATH = os.path.join(BASE_DIR, "data", "gold_prices.csv")
 PRED_PATH = os.path.join(BASE_DIR, "data", "predictions.csv")
 LEVELS_PATH = os.path.join(BASE_DIR, "data", "levels_history.csv")
 ALARMS_PATH = os.path.join(BASE_DIR, "data", "alarms.csv")
+TUNING_PATH = os.path.join(BASE_DIR, "tuning.json")   # written by daily_agent.py
 
 PRED_HEADER = ["timestamp_utc", "timestamp_cairo", "final_pct", "direction",
                "confidence", "technical", "consensus", "news", "price_21k",
@@ -76,7 +77,25 @@ def _env_weight(name, default):
         return default
 
 
+def _tuned(section, key, default):
+    """Read a value from tuning.json (written by daily_agent.py).
+
+    Returns default when the file/section/key is missing or malformed.
+    Callers keep env-var priority by using this as their _env_* default.
+    """
+    try:
+        with open(TUNING_PATH, encoding="utf-8") as fh:
+            v = (json.load(fh).get(section) or {}).get(key)
+        if isinstance(v, (int, float)):
+            return float(v)
+    except (OSError, ValueError, AttributeError):
+        pass
+    return default
+
+
 # Weights are env-tunable so recalibration never needs a code change.
+# Since 2026-10-24 the daily AI agent (daily_agent.py) can also adjust
+# them, via tuning.json - priority: env var > tuning.json > defaults.
 # Weight study (2026-10, data: 2y GC=F + USDEGP + 43d real CSV, see
 # scripts/study_weights.py in the addon workspace): the source site COMPUTES
 # its 21K price as global ounce x parallel-market USD/EGP (verified mean
@@ -86,12 +105,44 @@ def _env_weight(name, default):
 # (2y disagreement subset 55-58% vs 47% for global-heavy; real 43d replay
 # 63% vs 41%, small n). Defaults below shift local from 40/30 to 50/20 while
 # keeping the global anchor; override via env vars without touching code.
+def _weight(key, env_name, default):
+    """Weight priority: env var (explicitly set) > tuning.json > default."""
+    env = os.environ.get(env_name, "").strip()
+    if env:
+        try:
+            v = float(env)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    return _tuned("weights", key, default)
+
+
 WEIGHTS = {
-    "technical": _env_weight("WEIGHT_TECHNICAL", 0.50),
-    "consensus": _env_weight("WEIGHT_CONSENSUS", 0.20),
-    "news": _env_weight("WEIGHT_NEWS", 0.30),
+    "technical": _weight("technical", "WEIGHT_TECHNICAL", 0.50),
+    "consensus": _weight("consensus", "WEIGHT_CONSENSUS", 0.20),
+    "news": _weight("news", "WEIGHT_NEWS", 0.30),
 }
-UP_THRESHOLD, DOWN_THRESHOLD = 58, 42          # % outside this band = directional
+
+
+def _threshold(key, env_name, default, lo, hi):
+    env = os.environ.get(env_name, "").strip()
+    if env:
+        try:
+            return int(_env_float(env_name, default))
+        except ValueError:
+            pass
+    return int(_clamp(_tuned("thresholds", key, default), lo, hi))
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+UP_THRESHOLD = _threshold("up_threshold", "UP_THRESHOLD", 58, 55, 70)
+DOWN_THRESHOLD = _threshold("down_threshold", "DOWN_THRESHOLD", 42, 30, 45)
+if UP_THRESHOLD < DOWN_THRESHOLD + 10:   # sanity: keep a real FLAT band
+    UP_THRESHOLD, DOWN_THRESHOLD = 58, 42
 NOTIFY_DELTA = 15.0                            # points vs previous run
 ACCURACY_WINDOW = 30                           # graded rows for the accuracy stat
 
@@ -115,11 +166,13 @@ DIGEST_WEEKDAY = _env_int("DIGEST_WEEKDAY", 5)  # weekly digest day, 0=Mon..6=Su
 # Anti-twitch: a crossing must clear its rung by this many points to ring
 # instantly; a weaker crossing waits until the gauge HOLDS the rung for a
 # second run. 0 = every crossing rings instantly (old behaviour).
-LADDER_CONFIRM = _env_float("LADDER_CONFIRM", 2.0)
+LADDER_CONFIRM = _env_float("LADDER_CONFIRM",
+                            _tuned("knobs", "ladder_confirm", 2.0))
 
 # SELL WINDOW milestone: rings when 21K rises this far above the day's
 # average price (percent, or absolute EGP line; 0 disables a knob).
-MILESTONE_PCT = _env_float("MILESTONE_PCT", 0.5)
+MILESTONE_PCT = _env_float("MILESTONE_PCT",
+                           _tuned("knobs", "milestone_pct", 0.5))
 MILESTONE_EGP = _env_float("MILESTONE_EGP", 0.0)
 # Until this many runs exist today (3 runs = first ~3 hours at hourly
 # cadence), the baseline is yesterday's average with outliers trimmed.

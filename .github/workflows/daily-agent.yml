@@ -1,0 +1,66 @@
+name: Daily AI Review
+
+# 21:00 UTC = 23:00 Cairo (EET) / 00:00 Cairo (EEST) - the end of the
+# Cairo day. GitHub's scheduler is best-effort: runs can start a few
+# minutes late; that is normal.
+on:
+  schedule:
+    - cron: '0 21 * * *'
+  workflow_dispatch:      # manual "Run workflow" button for tests
+
+permissions:
+  contents: write         # needed to commit tuning.json / grading updates
+
+concurrency:
+  group: daily-agent      # never run two reviews at the same time
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # The AI agent reads the data digest, decides what to change to
+      # improve accuracy (weights / knobs / thresholds, all clamped by
+      # daily_agent.py), applies it to tuning.json and reports on
+      # Telegram in English + Arabic. Degrades to a report-only digest
+      # if the LLM key is missing.
+      - name: AI daily review
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LLM_BASE_URL: https://api.groq.com/openai/v1
+          LLM_MODEL: openai/gpt-oss-20b
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: python daily_agent.py
+
+      - name: Commit review results
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          ok=0
+          for i in 1 2 3; do
+            git pull --rebase --autostash origin main >/dev/null 2>&1 || true
+            git add tuning.json data/tuning_log.csv data/predictions.csv data/levels_history.csv 2>/dev/null || true
+            if git diff --cached --quiet; then
+              echo "Nothing to commit."
+              ok=1
+              break
+            fi
+            git commit -m "daily-agent: AI accuracy review $(date -u +'%Y-%m-%d')"
+            if git push origin main; then ok=1; break; fi
+            sleep 8
+          done
+          [ $ok -eq 1 ] || echo "::warning::push failed after retries"

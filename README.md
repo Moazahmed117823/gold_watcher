@@ -127,3 +127,30 @@ python scraper.py --force-notify     # also test your Telegram bot
 | CSV has duplicate timestamps | Two runs overlapped before `concurrency` was added, or you ran `workflow_dispatch` during a scheduled run. Harmless. |
 | Scheduled runs stopped | 60-day auto-disable (see above) — re-enable in the Actions tab. |
 ## For hamada
+
+## Daily AI Review (added 2026-10-24)
+
+Every day at **21:00 UTC = end of the Cairo day** (23:00 EET / 00:00 EEST),
+`.github/workflows/daily-agent.yml` runs `daily_agent.py`:
+
+1. Grades any pending predictions, then builds a full **data digest**
+   (accuracy strict/direction/FLAT, per-signal-group agreement with the real
+   24h move, alarm report card, market summary, data health, current config,
+   past tuning history).
+2. Hands the digest to the **AI agent** (same `LLM_API_KEY` secret as the news
+   reader). The agent decides a small, evidence-based set of changes:
+   signal weights, `LADDER_CONFIRM`, `MILESTONE_PCT`, and the UP/DOWN
+   thresholds. It may also decide **no changes** - that is a valid outcome.
+3. The runner **validates and clamps** everything: weights land in
+   0.10-0.60 (max move 0.10/group/day, renormalized), knobs in their ranges,
+   thresholds in 55-70 / 30-45 with `up >= down + 10`, max 3 changes/day,
+   and **no changes at all** while graded calls < 15.
+4. Accepted decisions go to `tuning.json` (priority: env var > tuning.json >
+   built-in defaults) and `data/tuning_log.csv`, then the workflow commits
+   them so you can review or `git revert` any day's decisions.
+5. The agent's own report (what it found + what it changed and why) is sent
+   through the regular Telegram bot in **English and Arabic**. If the agent
+   is unreachable, a digest-only fallback report is sent and nothing changes.
+
+Manual test: Actions tab -> **Daily AI Review** -> Run workflow
+(locally: `python daily_agent.py --digest` to just print the digest).
