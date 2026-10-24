@@ -50,7 +50,7 @@ def main():
             print("  " + " | ".join(r))
         return 0
 
-    if not args.p21:
+    if args.p21 is None:
         ap.error("--21k is required (or use --show)")
 
     os.makedirs(DATA_DIR, exist_ok=True)
