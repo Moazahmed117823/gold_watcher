@@ -1,4 +1,4 @@
 timestamp_utc,timestamp_cairo,kind,detail,est_pct,price,graded,actual_pct,verdict
 2026-10-23 07:01:12,2026-10-23 10:01:12,gauge,down:42,-0.50,6290,1,-0.08,miss
-2026-10-23 13:01:10,2026-10-23 16:01:10,gauge,down:35,-0.90,6305,,,
+2026-10-23 13:01:10,2026-10-23 16:01:10,gauge,down:35,-0.90,6305,1,-0.32,miss
 2026-10-23 22:01:19,2026-10-24 01:01:19,gauge,down:42,-0.50,6285,,,
