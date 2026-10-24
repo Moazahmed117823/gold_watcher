@@ -1,5 +1,5 @@
 {
-  "updated_utc": "2026-10-24 11:21:50",
+  "updated_utc": "2026-10-24 11:25:20",
   "weights": {
     "technical": 0.461,
     "consensus": 0.216,
@@ -11,7 +11,7 @@
   },
   "thresholds": {
     "up_threshold": 58.0,
-    "down_threshold": 45
+    "down_threshold": 42
   },
-  "last_change_reason": "Accuracy 50%, direction 44%. Two missed down alarms linked to ladder_confirm 3 and down_threshold 45. Technical weight 0.461 is fine."
+  "last_change_reason": "Overall accuracy 50% (54 graded). Direction accuracy 44% (4/9). Two missed down alarms at 07:01 and 13:01 because down_threshold 45 was too high. Lowering it to 42 will trigger those alarms and improve direction hits."
 }
