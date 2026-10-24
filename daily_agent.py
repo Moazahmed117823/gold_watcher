@@ -945,7 +945,9 @@ def maybe_force_review(decisions):
                "the code-patch pipeline end to end. Inspect the region and "
                "fix a real small issue if you can see one; a tiny guard or "
                "docstring is acceptable. If nothing warrants a change, "
-               "return an empty patch. All runner rails still apply.",
+               "return an empty patch. All runner rails still apply."
+               + (" MAINTAINER HINT: " + os.environ.get("FORCE_WHY", "").strip()
+                  if os.environ.get("FORCE_WHY", "").strip() else ""),
     }
     print(f"  [patch] FORCED test drill on {files}")
     return decisions

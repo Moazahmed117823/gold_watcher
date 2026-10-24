@@ -16,6 +16,10 @@ on:
         description: 'Focus keyword for the forced review (e.g. p21)'
         required: false
         default: ''
+      force_why:
+        description: 'Optional hint of the suspected issue for the forced review'
+        required: false
+        default: ''
 
 permissions:
   contents: write         # needed to commit tuning.json / grading updates
@@ -55,6 +59,7 @@ jobs:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           FORCE_CODE_REVIEW: ${{ github.event.inputs.force_code_review }}
           FORCE_FOCUS: ${{ github.event.inputs.force_focus }}
+          FORCE_WHY: ${{ github.event.inputs.force_why }}
         run: python daily_agent.py
 
       - name: Commit review results
