@@ -2,6 +2,11 @@ name: Egypt Gold Watcher
 
 on:
   workflow_dispatch:      # allows manual "Run workflow" button in the Actions tab
+    inputs:
+      force:
+        description: 'Send the Telegram report even if nothing changed (test)'
+        type: boolean
+        default: false
 
 permissions:
   contents: write        # needed so the workflow can commit the updated CSV
@@ -52,7 +57,7 @@ jobs:
           LLM_BASE_URL: https://api.groq.com/openai/v1
           LLM_MODEL: openai/gpt-oss-20b
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-        run: python predictor.py
+        run: python predictor.py ${{ inputs.force == true && '--force' || '' }}
 
       - name: Commit price history
         run: |
