@@ -1,17 +1,17 @@
 {
-  "updated_utc": "2026-10-24 11:16:19",
+  "updated_utc": "2026-10-24 11:21:50",
   "weights": {
     "technical": 0.461,
     "consensus": 0.216,
     "news": 0.323
   },
   "knobs": {
-    "ladder_confirm": 3.0,
+    "ladder_confirm": 2.0,
     "milestone_pct": 0.5
   },
   "thresholds": {
     "up_threshold": 58.0,
     "down_threshold": 45
   },
-  "last_change_reason": "Accuracy 50% (54 graded). Direction 44% (9/9). Technical agreement 53%, consensus 50%, news 48%. Two alarms missed due to low down threshold and ladder_confirm. Technical weight 0.473 may over‑emphasize technical signals."
+  "last_change_reason": "Accuracy 50%, direction 44%. Two missed down alarms linked to ladder_confirm 3 and down_threshold 45. Technical weight 0.461 is fine."
 }
