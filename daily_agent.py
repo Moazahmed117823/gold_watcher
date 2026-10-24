@@ -26,10 +26,22 @@ DECIDES what, if anything, to change to improve accuracy:
                 [0.3..1.0]; up_threshold [55..70] / down_threshold
                 [30..45] with up >= down + 10; max 3 changes; nothing
                 at all when graded calls < 15.
+  3b. CODE PATCH - if the agent sees concrete evidence of a CODE or DATA
+                bug (broken scraper source, wrong grading, malformed rows,
+                logic error) it may request to inspect an allowlisted file,
+                receive the relevant region, and return small find/replace
+                patches. The runner enforces hard rails: file allowlist,
+                exact-match find, size caps, an injection scan (no env
+                access / subprocess / eval / unknown hosts in added code),
+                py_compile + import smoke test, and automatic rollback on
+                any failure. Applied patches get their own git commit and
+                are logged to data/patch_log.csv.
   4. APPLY    - accepted decisions go to tuning.json (predictor.py
                 reads it; env vars still override) and to
                 data/tuning_log.csv. Everything lands as a git commit.
-  5. REPORT   - the agent's own Telegram message is sent through the
+  5. REPORT   - the agent's own Telegram message PLUS a factual code-
+                patch section (ground truth from the runner) is sent
+                through the
                 project bot (same secrets/recipients as the gauge).
                 If the agent is unavailable, a template digest report
                 is sent instead (report-only, never a blind change).
@@ -43,10 +55,12 @@ Exit code is always 0 so the workflow's commit step can still store
 grading/tuning output.
 """
 import argparse
+import ast
 import csv
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import traceback
@@ -79,6 +93,19 @@ MIN_GRADED_FOR_CHANGES = 15
 DEFAULT_WEIGHTS = {"technical": 0.50, "consensus": 0.20, "news": 0.30}
 DEFAULT_KNOBS = {"ladder_confirm": 2.0, "milestone_pct": 0.5}
 DEFAULT_THRESHOLDS = {"up_threshold": 58, "down_threshold": 42}
+
+# ---- code-patch rails ----------------------------------------------------- #
+ALLOW_CODE_PATCH = os.environ.get("ALLOW_CODE_PATCH", "1") not in (
+    "0", "false", "no")
+PATCH_FILES = frozenset({
+    "predictor.py", "technical.py", "consensus.py", "news_reader.py",
+    "scraper.py", "real_prices.py", "llm.py"})
+PATCH_MAX_BLOCKS = 3       # find/replace blocks per night
+PATCH_MAX_BLOCK_LINES = 60 # max lines of find OR replace per block
+PATCH_MAX_ROUNDS = 2       # inspection rounds before the final patch
+PATCH_LOG_PATH = os.path.join(DATA_DIR, "patch_log.csv")
+PATCH_LOG_HEADER = ["date_utc", "status", "files", "blocks", "changed_lines",
+                    "commit", "why", "detail"]
 
 SYS_PROMPT = (
     "You are the daily AI reviewer and tuner of 'gold_watcher', an Egypt "
@@ -135,7 +162,22 @@ SYS_PROMPT = (
     ' "changes": [ ... 0..3 change objects ... ],\n'
     ' "report_en": "full Telegram message in English, plain text, section '
     "titles + blank lines, max 1800 chars\",\n"
-    ' "report_ar": "Arabic version of report_en, max 1800 chars"\n'
+    ' "report_ar": "Arabic version of report_en, max 1800 chars",\n'
+    ' "code_review": omit or null normally. ONLY when the digest shows '
+    "concrete\n"
+    "   evidence of a CODE or DATA bug (broken scraper source, wrong "
+    "grading,\n"
+    "   malformed rows, overdue grading growing, a logic error visible in "
+    "the\n"
+    '   numbers) request: {"files": ["scraper.py"], "focus": "keyword or '
+    'function",\n'
+    '   "why": "<= 40 words citing the evidence"}. Allowed files: '
+    "predictor.py,\n"
+    "   technical.py, consensus.py, news_reader.py, scraper.py, "
+    "real_prices.py,\n"
+    "   llm.py. A normal accuracy dip or noisy market is NOT a code problem "
+    "-\n"
+    "   do not request a review for that.\n"
     "}\n"
     "If no changes: \"changes\": []."
 )
@@ -449,20 +491,16 @@ def _llm_cfg():
             "model": os.environ.get("LLM_MODEL", "").strip()}
 
 
-def call_agent(digest, retries=2):
-    """Ask the LLM agent to review the digest. Returns dict | None."""
+def call_agent_raw(messages, max_tokens=1800, retries=2):
+    """Send a message list to the LLM agent. Returns parsed dict | None."""
     cfg = _llm_cfg()
     if not (cfg["base"] and cfg["key"] and cfg["model"]):
-        print("  [agent] LLM_* not configured -> report-only fallback")
         return None
     payload = {
         "model": cfg["model"],
-        "messages": [{"role": "system", "content": SYS_PROMPT},
-                     {"role": "user",
-                      "content": "DATA DIGEST:\n" + json.dumps(
-                          digest, ensure_ascii=False)}],
+        "messages": messages,
         "temperature": 0.2,
-        "max_tokens": 1800,
+        "max_tokens": max_tokens,
         "response_format": {"type": "json_object"},
     }
     headers = {"Authorization": f"Bearer {cfg['key']}"}
@@ -486,6 +524,19 @@ def call_agent(digest, retries=2):
             if attempt < retries:
                 time.sleep(4.0)
     return None
+
+
+def call_agent(digest, retries=2):
+    """Ask the LLM agent to review the digest. Returns dict | None."""
+    cfg = _llm_cfg()
+    if not (cfg["base"] and cfg["key"] and cfg["model"]):
+        print("  [agent] LLM_* not configured -> report-only fallback")
+        return None
+    return call_agent_raw(
+        [{"role": "system", "content": SYS_PROMPT},
+         {"role": "user",
+          "content": "DATA DIGEST:\n" + json.dumps(digest, ensure_ascii=False)}],
+        retries=retries)
 
 
 # --------------------------------------------------------------------------- #
@@ -597,6 +648,346 @@ def apply_tuning(new_weights, new_knobs, new_thresholds, applied, decisions,
 
 
 # --------------------------------------------------------------------------- #
+# Code-patch phase: agent may inspect allowlisted files and propose
+# small find/replace fixes; the runner clamps, scans, tests, and rolls back.
+# --------------------------------------------------------------------------- #
+CODE_SYS_PROMPT = (
+    "You are the code-repair arm of the nightly gold_watcher reviewer. You "
+    "may FIX code bugs that hurt accuracy or data quality. STRICT RULES:\n"
+    "- You may only patch: predictor.py, technical.py, consensus.py,\n"
+    "  news_reader.py, scraper.py, real_prices.py, llm.py.\n"
+    "- Fixes must be SMALL and surgical: a broken selector, a wrong "
+    "constant, a wrong formula, a parse bug, a guard. Never redesign, never "
+    "reformat, never delete features.\n"
+    "- 'find' must be copied EXACTLY from the shown file region (it must "
+    "match exactly once). Keep the original indentation.\n"
+    "- ADDED code must NOT: read environment variables, spawn processes, "
+    "use eval/exec, encode payloads, or contact any host not already used "
+    "by this repo. The runner rejects such patches automatically.\n"
+    "- If the evidence is weak or the code looks correct, patch nothing - "
+    "a wrong fix is worse than no fix."
+)
+
+
+def _repo_file(rel):
+    return os.path.join(BASE_DIR, rel)
+
+
+def _known_hosts():
+    """Hosts already contacted somewhere in the repo's own python files."""
+    hosts = set()
+    for name in sorted(PATCH_FILES):
+        try:
+            with open(_repo_file(name), encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        hosts.update(m.group(1).lower()
+                     for m in re.finditer(r"https?://([A-Za-z0-9.-]+)", text))
+    return hosts
+
+
+def _outline(rel, cap=80):
+    """Compact top-level outline (line numbers + defs/classes)."""
+    try:
+        with open(_repo_file(rel), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+    except Exception:  # noqa: BLE001
+        return "  (outline unavailable)"
+    lines = []
+    for node in tree.body[:60]:
+        kind = type(node).__name__
+        name = getattr(node, "name", "?")
+        lines.append(f"  L{getattr(node, 'lineno', 0):4d}: {kind} {name}")
+    return "\n".join(lines[:cap])
+
+
+def _region(rel, keyword, width=30, cap=210):
+    """Numbered source lines around each case-insensitive keyword match."""
+    try:
+        with open(_repo_file(rel), encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return "(file unreadable)"
+    kw = (keyword or "").strip().lower()
+    if not kw:
+        return "(no keyword given)"
+    hits = [i for i, ln in enumerate(lines) if kw in ln.lower()][:6]
+    if not hits:
+        return f"(keyword {keyword!r} not found in {rel})"
+    windows, last_a, last_b = [], -1, -1
+    for i in hits:
+        a, b = max(0, i - width), min(len(lines), i + width + 1)
+        if a <= last_b:
+            windows[-1] = (last_a, b)
+        else:
+            windows.append((a, b))
+        last_a, last_b = windows[-1]
+    out, total = [], 0
+    for a, b in windows:
+        for j in range(a, b):
+            if total >= cap:
+                out.append("  ... (truncated)")
+                return "\n".join(out)
+            out.append(f"{j + 1:4d}| {lines[j].rstrip()}")
+            total += 1
+    return "\n".join(out)
+
+
+def scan_patch_safety(added_text, known_hosts):
+    """Violations in the ADDED lines of a patch (injection defenses)."""
+    bad = []
+    lowered = added_text.lower()
+    for pat in ("os.environ", "getenv(", "subprocess", "eval(", "exec(",
+                "__import__", "popen", "system(", "pickle", "base64",
+                "socket", "chmod", "github_env", "telemetry", "webhook",
+                "telegram_bot_token", "llm_api_key", "chat_id"):
+        if pat in lowered:
+            bad.append(f"forbidden token in added code: {pat!r}")
+    for m in re.finditer(r"https?://([A-Za-z0-9.-]+)", added_text):
+        host = m.group(1).lower()
+        if host not in known_hosts:
+            bad.append(f"added code contacts unknown host: {host}")
+    return bad
+
+
+def _block_check(block, known_hosts):
+    """Validate one find/replace block. Returns (error, added_line_count)."""
+    if not isinstance(block, dict):
+        return "block is not an object", 0
+    rel = str(block.get("file", "")).strip()
+    if rel not in PATCH_FILES:
+        return (f"file {rel!r} not in patch allowlist {sorted(PATCH_FILES)}",
+                0)
+    find, repl = block.get("find"), block.get("replace")
+    if not isinstance(find, str) or not find.strip():
+        return "missing 'find' text", 0
+    if not isinstance(repl, str):
+        return "missing 'replace' text", 0
+    if (len(find.splitlines()) > PATCH_MAX_BLOCK_LINES
+            or len(repl.splitlines()) > PATCH_MAX_BLOCK_LINES):
+        return f"block too large (> {PATCH_MAX_BLOCK_LINES} lines)", 0
+    bad = scan_patch_safety(repl, known_hosts)
+    if bad:
+        return "safety scan: " + "; ".join(bad[:3]), 0
+    return "", len(repl.splitlines())
+
+
+def apply_code_patch(blocks, known_hosts):
+    """Apply find/replace blocks, then compile + import test.
+
+    Returns (ok, detail, files_touched, added_lines).
+    On ANY failure every file is restored byte-identical.
+    """
+    if not isinstance(blocks, list) or not blocks:
+        return False, "no/empty patch list", [], 0
+    if len(blocks) > PATCH_MAX_BLOCKS:
+        return False, (f"too many blocks ({len(blocks)} > "
+                       f"{PATCH_MAX_BLOCKS})"), [], 0
+    added = 0
+    for b in blocks:
+        err, n = _block_check(b, known_hosts)
+        if err:
+            return False, err, [], 0
+        added += n
+    originals, patched = {}, {}
+    for b in blocks:
+        rel = b["file"]
+        if rel not in originals:
+            try:
+                with open(_repo_file(rel), encoding="utf-8") as fh:
+                    originals[rel] = fh.read()
+            except OSError as err:
+                return False, f"cannot read {rel}: {err}", [], 0
+        find, repl = b["find"], b["replace"]
+        n = originals[rel].count(find) if rel not in patched else \
+            patched[rel].count(find)
+        if n != 1:
+            return False, (f"'find' text must match EXACTLY once in {rel} "
+                           f"(matched {n})"), [], 0
+        base = patched.get(rel, originals[rel])
+        patched[rel] = base.replace(find, repl)
+    for rel, text in patched.items():
+        with open(_repo_file(rel), "w", encoding="utf-8") as fh:
+            fh.write(text)
+    try:
+        for rel in sorted(patched):
+            r = subprocess.run(
+                [sys.executable, "-m", "py_compile", _repo_file(rel)],
+                capture_output=True, timeout=60)
+            if r.returncode != 0:
+                raise RuntimeError("py_compile failed for "
+                                   f"{rel}: {r.stderr.decode()[-300:]}")
+        for rel in sorted(patched):
+            mod = rel[:-3] if rel.endswith(".py") else rel
+            r = subprocess.run(
+                [sys.executable, "-c",
+                 f"import importlib; importlib.import_module({mod!r})"],
+                cwd=BASE_DIR, capture_output=True, timeout=90)
+            if r.returncode != 0:
+                raise RuntimeError(f"import test failed for {mod}: "
+                                   f"{r.stderr.decode()[-300:]}")
+    except Exception as err:  # noqa: BLE001
+        for rel, text in originals.items():     # rollback, byte-identical
+            with open(_repo_file(rel), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        return False, f"validation failed -> rolled back: {err}", \
+            sorted(patched), 0
+    return True, "applied + compiled + imported OK", sorted(patched), added
+
+
+def commit_code_patch(files, why):
+    """Commit + push patched files. Returns (ok, detail, short_hash)."""
+    msg = ("daily-agent: AI code patch - " + (why or "accuracy fix"))[:100]
+    idcfg = ["-c", "user.name=github-actions[bot]",
+             "-c", "user.email=41898282+github-actions[bot]@users.noreply"
+                   ".github.com"]
+    for _ in range(3):
+        subprocess.run(["git", "pull", "--rebase", "--autostash",
+                        "origin", "main"], cwd=BASE_DIR, capture_output=True)
+        subprocess.run(["git", "add", *files], cwd=BASE_DIR,
+                       capture_output=True)
+        rc = subprocess.run(["git", *idcfg, "commit", "-m", msg],
+                            cwd=BASE_DIR, capture_output=True)
+        if rc.returncode != 0:
+            return False, "nothing committed (" + \
+                rc.stdout.decode()[-100:].strip() + ")", ""
+        if subprocess.run(["git", "push", "origin", "main"], cwd=BASE_DIR,
+                          capture_output=True).returncode == 0:
+            h = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                               cwd=BASE_DIR, capture_output=True)
+            return True, "committed + pushed", h.stdout.decode().strip()
+        time.sleep(8)
+    return False, "push failed after retries (commit kept local)", ""
+
+
+def log_patch(status, files, blocks, changed, commit, why, detail):
+    os.makedirs(os.path.dirname(PATCH_LOG_PATH) or ".", exist_ok=True)
+    exists = os.path.exists(PATCH_LOG_PATH)
+    with open(PATCH_LOG_PATH, "a", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        if not exists:
+            w.writerow(PATCH_LOG_HEADER)
+        w.writerow([now_utc_str(), status, ",".join(files or []), blocks,
+                    changed, commit, (why or "")[:300], (detail or "")[:300]])
+
+
+def code_patch_section(decisions):
+    """Multi-turn code review. Returns a summary dict for the report."""
+    req = decisions.get("code_review") if isinstance(decisions, dict) else None
+    if not req or not isinstance(req, dict):
+        return None
+    why = str(req.get("why", "")).strip()[:300]
+    if not ALLOW_CODE_PATCH:
+        return {"status": "disabled", "why_en": why,
+                "detail": "code patching disabled via ALLOW_CODE_PATCH"}
+    files = [f for f in (req.get("files") or [])
+             if isinstance(f, str) and f in PATCH_FILES]
+    if not files:
+        return {"status": "rejected", "why_en": why,
+                "detail": "no allowlisted files requested"}
+    focus = str(req.get("focus", "")).strip() or files[0]
+    rel = files[0]
+    print(f"  [patch] agent requested code review: {files} focus={focus!r}")
+    known = _known_hosts()
+    messages = [
+        {"role": "system", "content": CODE_SYS_PROMPT},
+        {"role": "user", "content": (
+            f"You flagged a possible code/data bug and asked to inspect:\n"
+            f"files={files} focus={focus!r} evidence={why!r}\n\n"
+            f"OUTLINE of {rel}:\n{_outline(rel)}\n\n"
+            f"CODE around {focus!r} in {rel}:\n{_region(rel, focus)}\n\n"
+            "Reply with ONLY JSON, one of:\n"
+            '  {"more": {"around": "keyword"}}   <- ask for ONE more region\n'
+            '  {"patch": [{"file": "...", "find": "<exact existing text>", '
+            '"replace": "<new text>"}], "patch_why_en": "<=80 words", '
+            '"patch_why_ar": "Arabic"}\n'
+            '  {"patch": []}                     <- inspected, no fix '
+            "justified")},
+    ]
+    reply = None
+    for rnd in range(PATCH_MAX_ROUNDS):
+        reply = call_agent_raw(messages, max_tokens=1400)
+        if reply is None:
+            break
+        if (isinstance(reply.get("more"), dict)
+                and rnd < PATCH_MAX_ROUNDS - 1):
+            kw = str(reply["more"].get("around", "")).strip()
+            messages.append({"role": "assistant",
+                             "content": json.dumps(reply)})
+            follow = ('Now reply with ONLY the final JSON '
+                      '({"patch": [...]} or {"patch": []}).')
+            messages.append({"role": "user",
+                             "content": f"CODE around {kw!r} in {rel}:\n"
+                                        f"{_region(rel, kw)}\n\n" + follow})
+            continue
+        break
+    if not isinstance(reply, dict) or "patch" not in reply:
+        log_patch("no-patch", [rel], 0, 0, "", why,
+                  "agent inspection did not return a patch")
+        return {"status": "no-patch", "files": [rel], "why_en": why,
+                "detail": "agent inspection did not return a patch"}
+    why_en = str(reply.get("patch_why_en", "")).strip()[:600]
+    why_ar = str(reply.get("patch_why_ar", "")).strip()[:600]
+    blocks = reply["patch"] if isinstance(reply["patch"], list) else []
+    if not blocks:
+        print("  [patch] agent inspected the code and found no bug to fix")
+        log_patch("inspected-no-change", [rel], 0, 0, "", why_en, why)
+        return {"status": "inspected-no-change", "files": [rel],
+                "why_en": why_en or why, "why_ar": why_ar,
+                "detail": "no code fix justified"}
+    ok, detail, touched, changed = apply_code_patch(blocks, known)
+    status = "applied" if ok else "rolled-back"
+    commit = ""
+    if ok:
+        cok, cdet, commit = commit_code_patch(touched, why_en)
+        detail += " | " + cdet
+    log_patch(status, touched, len(blocks), changed, commit, why_en, detail)
+    print(f"  [patch] {status}: {detail}")
+    return {"status": status, "files": touched, "blocks": len(blocks),
+            "changed": changed, "why_en": why_en, "why_ar": why_ar,
+            "commit": commit, "detail": detail}
+
+
+def _append_patch_text(text, res, lang):
+    """Factual code-patch ground truth appended to the Telegram report."""
+    why = res.get("why_ar") if lang == "ar" and res.get("why_ar") \
+        else res.get("why_en", "")
+    st = res.get("status")
+    if st == "applied":
+        sec = (f"\n\nCODE PATCH APPLIED\nFiles: {', '.join(res['files'])} "
+               f"({res.get('blocks')} block(s), ~{res.get('changed')} lines)\n"
+               f"Why: {why}\nValidated (compile + import) and committed as "
+               f"{res.get('commit') or '(local commit)'} - takes effect on "
+               f"the next hourly run. Revert: git revert {res.get('commit')}"
+               if lang == "en" else
+               f"\n\nتم تطبيق تعديل على الكود\nالملفات: "
+               f"{', '.join(res['files'])} ({res.get('blocks')} مقطع، "
+               f"~{res.get('changed')} سطر)\nالسبب: {why}\nتم التحقق (ترجمة "
+               f"+ تشغيل) والحفظ باسم {res.get('commit')} - يسري من التشغيل "
+               f"الساعي القادم. للتراجع: git revert {res.get('commit')}")
+    elif st == "rolled-back":
+        sec = (f"\n\nCODE PATCH ATTEMPTED - ROLLED BACK\n{res.get('detail')}"
+               "\nNo code was changed."
+               if lang == "en" else
+               f"\n\nتمت محاولة تعديل الكود - وتم التراجع\n{res.get('detail')}"
+               "\nلم يتغير أي كود.")
+    elif st == "inspected-no-change":
+        sec = (f"\n\nCODE REVIEWED - NO CHANGE\nWhy: {why}"
+               if lang == "en" else
+               f"\n\nتمت مراجعة الكود - بدون تعديل\nالسبب: {why}")
+    else:
+        label = {"disabled": "code patching disabled",
+                 "rejected": "patch request rejected (file allowlist)",
+                 "no-patch": "code inspection returned no patch",
+                 "error": "code phase error"}.get(st, st)
+        sec = (f"\n\nCODE PATCH: {label}\n{res.get('detail', '')}"
+               if lang == "en" else
+               f"\n\nتعديل الكود: {label}\n{res.get('detail', '')}")
+    return (text + sec)[:3900]
+
+
+# --------------------------------------------------------------------------- #
 # Fallback report (agent unavailable) - pure digest, no decisions
 # --------------------------------------------------------------------------- #
 def fallback_report(digest):
@@ -693,6 +1084,16 @@ def main():
             traceback.print_exc()
             applied, notes = [], ["apply step error - nothing changed"]
 
+    # 1b) optional code-patch phase (only if the agent requested it)
+    patch_res = None
+    if decisions and not args.no_llm:
+        try:
+            patch_res = code_patch_section(decisions)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+            patch_res = {"status": "error",
+                         "detail": "code phase crashed (nothing changed)"}
+
     # 2) the report (agent's own, else fallback)
     if decisions and all(str(decisions.get(k, "")).strip()
                          for k in ("report_en", "report_ar")):
@@ -700,6 +1101,9 @@ def main():
         ar_text = str(decisions["report_ar"]).strip()[:3900]
     else:
         en_text, ar_text = fallback_report(digest)
+    if patch_res:
+        en_text = _append_patch_text(en_text, patch_res, "en")
+        ar_text = _append_patch_text(ar_text, patch_res, "ar")
     if notes:
         en_text += "\n\nRunner notes: " + "; ".join(notes)
         ar_text += "\n\nملاحظات المنفذ: " + "; ".join(notes)

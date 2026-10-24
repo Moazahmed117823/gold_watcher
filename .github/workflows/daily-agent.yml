@@ -53,7 +53,7 @@ jobs:
           ok=0
           for i in 1 2 3; do
             git pull --rebase --autostash origin main >/dev/null 2>&1 || true
-            git add tuning.json data/tuning_log.csv data/predictions.csv data/levels_history.csv 2>/dev/null || true
+            git add -A   # tuning, logs, grading, AI code patches (if any)
             if git diff --cached --quiet; then
               echo "Nothing to commit."
               ok=1

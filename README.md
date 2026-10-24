@@ -149,8 +149,35 @@ Every day at **21:00 UTC = end of the Cairo day** (23:00 EET / 00:00 EEST),
    built-in defaults) and `data/tuning_log.csv`, then the workflow commits
    them so you can review or `git revert` any day's decisions.
 5. The agent's own report (what it found + what it changed and why) is sent
-   through the regular Telegram bot in **English and Arabic**. If the agent
-   is unreachable, a digest-only fallback report is sent and nothing changes.
+   through the regular Telegram bot in **English and Arabic**, followed by a
+   factual code-patch section (see below). If the agent is unreachable, a
+   digest-only fallback report is sent and nothing changes.
+
+### AI code patches (added 2026-10-24, same day)
+
+If the digest shows concrete evidence of a CODE or DATA bug (broken scraper
+source, wrong grading, malformed rows, a logic error visible in the numbers),
+the agent may request to inspect one of the project files and return small
+find/replace fixes. The runner enforces hard rails:
+
+- **File allowlist**: `predictor.py`, `technical.py`, `consensus.py`,
+  `news_reader.py`, `scraper.py`, `real_prices.py`, `llm.py`. Workflows,
+  `daily_agent.py` itself, and data files can never be patched.
+- **Injection scan** on every added line: no environment-variable access, no
+  subprocess/eval/exec, no encoded payloads, no contact with any host the
+  repo does not already use.
+- **Exact match**: each `find` must match the file exactly once (no
+  ambiguous or hallucinated edits).
+- **Size caps**: max 3 blocks/night, max 60 lines each.
+- **Validation + auto-rollback**: after applying, every touched file must
+  still compile and import; on any failure all files are restored
+  byte-identical and the Telegram report says so.
+- Applied patches get their own commit (`daily-agent: AI code patch - ...`),
+  are logged to `data/patch_log.csv`, take effect on the next hourly run,
+  and can be undone with `git revert <hash>`.
+
+Set the workflow env `ALLOW_CODE_PATCH: '0'` to switch the code-patch phase
+off while keeping tuning + reports.
 
 Manual test: Actions tab -> **Daily AI Review** -> Run workflow
 (locally: `python daily_agent.py --digest` to just print the digest).
