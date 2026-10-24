@@ -491,7 +491,19 @@ def _llm_cfg():
             "model": os.environ.get("LLM_MODEL", "").strip()}
 
 
-def call_agent_raw(messages, max_tokens=1800, retries=2):
+_last_llm_ts = 0.0
+
+
+def _llm_gap(min_gap=4.0):
+    """Space consecutive LLM calls so burst limits are not hit."""
+    global _last_llm_ts
+    wait = min_gap - (time.time() - _last_llm_ts)
+    if wait > 0:
+        time.sleep(wait)
+    globals()["_last_llm_ts"] = time.time()
+
+
+def call_agent_raw(messages, max_tokens=1800, retries=3):
     """Send a message list to the LLM agent. Returns parsed dict | None."""
     cfg = _llm_cfg()
     if not (cfg["base"] and cfg["key"] and cfg["model"]):
@@ -504,13 +516,18 @@ def call_agent_raw(messages, max_tokens=1800, retries=2):
         "response_format": {"type": "json_object"},
     }
     headers = {"Authorization": f"Bearer {cfg['key']}"}
+    resp = None
     for attempt in range(1, retries + 1):
         try:
+            _llm_gap()
             resp = requests.post(f"{cfg['base']}/chat/completions",
                                  json=payload, headers=headers, timeout=60)
             if resp.status_code == 429 and attempt < retries:
                 hint = re.search(r"try again in ([\d.]+)s", resp.text)
-                time.sleep(min(float(hint.group(1)) + 0.5, 20.0) if hint else 5.0)
+                wait = min(float(hint.group(1)) + 0.5, 30.0) if hint else 6.0
+                print(f"  [agent] 429 rate-limited, retry in {wait:.0f}s",
+                      file=sys.stderr)
+                time.sleep(wait)
                 continue
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"]
@@ -519,11 +536,27 @@ def call_agent_raw(messages, max_tokens=1800, retries=2):
                 raise ValueError("no JSON object in agent reply")
             return json.loads(m.group(0))
         except Exception as err:  # noqa: BLE001
-            print(f"  [agent] attempt {attempt}/{retries} failed: {err}",
+            body = ""
+            if resp is not None and resp.status_code >= 400:
+                body = " | " + re.sub(r"\s+", " ", resp.text)[:260]
+            print(f"  [agent] attempt {attempt}/{retries} failed: {err}{body}",
                   file=sys.stderr)
             if attempt < retries:
                 time.sleep(4.0)
-    return None
+    # last resort: one try without response_format (some providers reject it)
+    try:
+        _llm_gap()
+        plain = dict(payload)
+        plain.pop("response_format", None)
+        resp = requests.post(f"{cfg['base']}/chat/completions",
+                             json=plain, headers=headers, timeout=60)
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+        m = re.search(r"\{.*\}", content or "", re.DOTALL)
+        return json.loads(m.group(0)) if m else None
+    except Exception as err:  # noqa: BLE001
+        print(f"  [agent] giving up: {err}", file=sys.stderr)
+        return None
 
 
 def call_agent(digest, retries=2):
