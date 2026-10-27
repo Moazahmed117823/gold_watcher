@@ -6,3 +6,4 @@ timestamp_utc,timestamp_cairo,kind,detail,est_pct,price,graded,actual_pct,verdic
 2026-10-26 12:01:17,2026-10-26 15:01:17,milestone,milestone,+0.52,6330,1,+0.08,held
 2026-10-26 15:01:14,2026-10-26 18:01:14,gauge,up:58,+0.50,6335,1,+0.08,miss
 2026-10-27 04:01:13,2026-10-27 07:01:13,gauge,up:58,+0.50,6340,,,
+2026-10-27 15:01:25,2026-10-27 18:01:25,milestone,milestone,+0.67,6380,,,
