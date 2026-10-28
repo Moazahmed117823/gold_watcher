@@ -1,9 +1,9 @@
 {
-  "updated_utc": "2026-10-24 22:54:02",
+  "updated_utc": "2026-10-28 00:15:18",
   "weights": {
-    "technical": 0.461,
-    "consensus": 0.216,
-    "news": 0.323
+    "technical": 0.489,
+    "consensus": 0.293,
+    "news": 0.218
   },
   "knobs": {
     "ladder_confirm": 2.0,
@@ -11,7 +11,7 @@
   },
   "thresholds": {
     "up_threshold": 58.0,
-    "down_threshold": 42
+    "down_threshold": 42.0
   },
-  "last_change_reason": "Overall accuracy 54% (65 graded). Direction accuracy 57% (8/14) and recent 89% (8/9). Two missed down alarms at 07:01 and 13:01 due to down_threshold 45. Lowering it to 42 should trigger those calls and improve direction hits."
+  "last_change_reason": "Overall accuracy 40% but direction 56%. Technical agreement 90% while consensus 26% and news 24%. Recent direction 100% shows no recent drift. A small weight shift to consensus and news should improve signal balance."
 }
