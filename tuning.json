@@ -1,9 +1,9 @@
 {
-  "updated_utc": "2026-10-28 00:15:18",
+  "updated_utc": "2026-10-30 00:37:32",
   "weights": {
-    "technical": 0.489,
-    "consensus": 0.293,
-    "news": 0.218
+    "technical": 0.47,
+    "consensus": 0.28,
+    "news": 0.25
   },
   "knobs": {
     "ladder_confirm": 2.0,
@@ -13,5 +13,5 @@
     "up_threshold": 58.0,
     "down_threshold": 42.0
   },
-  "last_change_reason": "Overall accuracy 40% but direction 56%. Technical agreement 90% while consensus 26% and news 24%. Recent direction 100% shows no recent drift. A small weight shift to consensus and news should improve signal balance."
+  "last_change_reason": "Overall accuracy 53% (190 graded). Direction accuracy 61% (42/69). Technical agreement 68%, consensus 46%, news 75%. Recent direction 55% shows no drift. A modest weight shift to boost news and reduce consensus should balance signals."
 }
