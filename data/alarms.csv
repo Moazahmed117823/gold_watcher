@@ -28,3 +28,4 @@ timestamp_utc,timestamp_cairo,kind,detail,est_pct,price,graded,actual_pct,verdic
 2026-11-04 17:01:13,2026-11-04 19:01:13,gauge,up:65,+0.90,6240,,,
 2026-11-04 22:01:11,2026-11-05 00:01:11,gauge,up:65,+0.90,6245,,,
 2026-11-04 22:01:11,2026-11-05 00:01:11,milestone,milestone,+0.73,6245,,,
+2026-11-05 11:01:26,2026-11-05 13:01:26,gauge,up:58,+0.50,6270,,,
