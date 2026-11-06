@@ -1,9 +1,9 @@
 {
-  "updated_utc": "2026-11-05 01:18:22",
+  "updated_utc": "2026-11-06 01:23:00",
   "weights": {
-    "technical": 0.45,
-    "consensus": 0.32,
-    "news": 0.23
+    "technical": 0.5,
+    "consensus": 0.34,
+    "news": 0.16
   },
   "knobs": {
     "ladder_confirm": 2.0,
@@ -11,7 +11,7 @@
   },
   "thresholds": {
     "up_threshold": 58.0,
-    "down_threshold": 40
+    "down_threshold": 40.0
   },
-  "last_change_reason": "335 graded, 65% direction accuracy, recent 0/10. Technical agreement 16%, consensus 45%, news 12%. Down_threshold 42 is too high for missed down alarms."
+  "last_change_reason": "Accuracy 54% overall, 66% direction, technical agreement 40%, consensus 53%, news 31%. Alarms hit 28%. Recent direction 69% shows no drift."
 }
