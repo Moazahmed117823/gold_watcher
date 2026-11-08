@@ -1,8 +1,8 @@
 {
-  "updated_utc": "2026-11-07 00:38:14",
+  "updated_utc": "2026-11-08 00:12:11",
   "weights": {
-    "technical": 0.45,
-    "consensus": 0.35,
+    "technical": 0.4,
+    "consensus": 0.4,
     "news": 0.2
   },
   "knobs": {
@@ -13,5 +13,5 @@
     "up_threshold": 58.0,
     "down_threshold": 40.0
   },
-  "last_change_reason": "Recent direction accuracy 57% (13/23) down from 65%. Technical agreement 36% low, consensus 64% high, news 35% moderate. Current weights 0.5/0.34/0.16 over‑emphasize technical. Adjusting weights to favor consensus should improve direction hits."
+  "last_change_reason": "Overall accuracy 53% with 65% direction hits. Technical agreement 43%, consensus 67%, news 48%. Current weights 0.45/0.35/0.20 under‑represent the highly agreeing consensus group. Increasing its weight should lift direction accuracy."
 }
