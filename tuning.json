@@ -1,8 +1,8 @@
 {
-  "updated_utc": "2026-11-09 00:33:27",
+  "updated_utc": "2026-11-10 03:10:24",
   "weights": {
-    "technical": 0.3,
-    "consensus": 0.5,
+    "technical": 0.25,
+    "consensus": 0.55,
     "news": 0.2
   },
   "knobs": {
@@ -13,5 +13,5 @@
     "up_threshold": 58.0,
     "down_threshold": 40.0
   },
-  "last_change_reason": "Technical agreement 5% vs consensus 81% – consensus dominates. Current weights 0.4/0.4/0.2 under‑represent consensus. Shifting to 0.3/0.5/0.2 should boost direction hits without over‑tuning."
+  "last_change_reason": "Overall 456 calls, 67% direction accuracy, consensus dominates (95% agreement). Current weights 0.3/0.5/0.2 under‑represent consensus. Increase consensus weight by 0.05, reduce technical by 0.05 to stay within 0.10 limit."
 }
