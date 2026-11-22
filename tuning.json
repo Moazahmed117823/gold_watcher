@@ -1,9 +1,9 @@
 {
-  "updated_utc": "2026-11-21 01:58:24",
+  "updated_utc": "2026-11-22 00:57:36",
   "weights": {
-    "technical": 0.18,
-    "consensus": 0.6,
-    "news": 0.22
+    "technical": 0.189,
+    "consensus": 0.579,
+    "news": 0.232
   },
   "knobs": {
     "ladder_confirm": 2.0,
@@ -13,5 +13,5 @@
     "up_threshold": 58.0,
     "down_threshold": 40.0
   },
-  "last_change_reason": "Recent accuracy 70% (21/30) but alarms miss 5/6. Technical agreement 100% yet weight 0.15. Ladder_confirm 2.5 may be too high. Proposed: bump technical to 0.18, drop news to 0.22, keep consensus 0.60; lower ladder_confirm to 2.0."
+  "last_change_reason": "Consensus agreement 54% vs tech 90% and news 87%. Current consensus weight 0.60 is too high for its low agreement. Reducing it to 0.55 should improve direction accuracy while staying within 0.10 limit."
 }
