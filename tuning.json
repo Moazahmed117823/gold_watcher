@@ -1,8 +1,8 @@
 {
-  "updated_utc": "2026-11-22 00:57:36",
+  "updated_utc": "2026-11-23 01:24:41",
   "weights": {
-    "technical": 0.189,
-    "consensus": 0.579,
+    "technical": 0.239,
+    "consensus": 0.529,
     "news": 0.232
   },
   "knobs": {
@@ -13,5 +13,5 @@
     "up_threshold": 58.0,
     "down_threshold": 40.0
   },
-  "last_change_reason": "Consensus agreement 54% vs tech 90% and news 87%. Current consensus weight 0.60 is too high for its low agreement. Reducing it to 0.55 should improve direction accuracy while staying within 0.10 limit."
+  "last_change_reason": "Overall accuracy 57% with 765 graded calls. Technical agreement 48% is low, consensus 78% high. Recent alarms miss 5/6. Increasing technical weight and reducing consensus weight should improve direction hits."
 }
