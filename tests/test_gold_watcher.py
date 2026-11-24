@@ -329,6 +329,123 @@ class MergeAndMigrationTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# Regressions for the three v12 follow-up fixes
+# --------------------------------------------------------------------------- #
+class V12BugfixRegressionTests(unittest.TestCase):
+    """1) grade_pending() grades FLAT calls by the real FLAT band, 2)
+    fx_mean_reversion() picks the quote by timestamp, refuses stale feeds
+    and anchors the 24h lookback on the quote itself, 3) the ladder stays
+    inside the gauge's [2, 98] domain at extreme thresholds."""
+
+    # --- bug 1: FLAT grading band ---------------------------------------- #
+    def test_flat_grades_correct_at_59_and_41(self):
+        # pct 59 and 41 are FLAT calls (band 36..61) but sit outside the old
+        # hardcoded |pct-50|<8 window; on a flat 24h move they must grade 1.
+        tmp = tempfile.mkdtemp(prefix="gw_grade_")
+        orig = (predictor.PRED_PATH, predictor.CSV_PATH)
+        predictor.PRED_PATH = os.path.join(tmp, "predictions.csv")
+        predictor.CSV_PATH = os.path.join(tmp, "gold_prices.csv")
+        try:
+            now = datetime.now(timezone.utc)
+            ts0 = now - timedelta(hours=25)
+            # 21K nearly flat over the grading window: 6300 -> 6301 is
+            # +0.016% (< the 0.1% dead zone) -> actual = "flat"
+            with open(predictor.CSV_PATH, "w", newline="",
+                      encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                w.writerow(["timestamp_utc", "gold_21k_sell", "usd_egp"])
+                w.writerow([_ts(ts0), "6300", "50.00"])
+                w.writerow([_ts(ts0 + timedelta(hours=26)), "6301", "50.00"])
+            with open(predictor.PRED_PATH, "w", newline="",
+                      encoding="utf-8") as fh:
+                w = csv.DictWriter(fh, fieldnames=predictor.PRED_HEADER)
+                w.writeheader()
+                for pct in (59, 41, 50):
+                    w.writerow({"timestamp_utc": _ts(ts0),
+                                "timestamp_cairo": _ts(ts0 + timedelta(hours=3)),
+                                "final_pct": pct, "direction": "FLAT",
+                                "price_21k": "6300"})
+            self.assertIsNotNone(predictor.grade_pending())
+            with open(predictor.PRED_PATH, newline="",
+                      encoding="utf-8") as fh:
+                rows = list(csv.DictReader(fh))
+            graded = {int(r["final_pct"]): r["predicted_correct"]
+                      for r in rows if r["graded_at_utc"]}
+            self.assertEqual(graded[59], "1")   # old code: 0 (|59-50| = 9)
+            self.assertEqual(graded[41], "1")   # old code: 0 (|41-50| = 9)
+            self.assertEqual(graded[50], "1")   # unchanged region stays 1
+        finally:
+            predictor.PRED_PATH, predictor.CSV_PATH = orig
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # --- bug 2: stale / out-of-order fx quotes --------------------------- #
+    def test_fx_stale_latest_quote_is_neutral(self):
+        # latest quote is 10h old (scraper stalled) -> neutral 0.0, "stale"
+        tmp = tempfile.mkdtemp(prefix="gw_fxstale_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "gold_prices.csv")
+        _write_prices_csv(path, [(_ts(NOW - timedelta(hours=34)), "50.00"),
+                                 (_ts(NOW - timedelta(hours=10)), "50.25")])
+        res = predictor.fx_mean_reversion(path, now=NOW)
+        self.assertEqual(res["score"], 0.0)
+        self.assertIn("stale", res["detail"])
+
+    def test_fx_quote_exactly_3h_old_still_live_and_anchored(self):
+        # 3h old is ON the stale boundary (not > 3h) -> live. The 24h
+        # lookback anchors on the quote's own timestamp (NOW-3h-24h = NOW-27h)
+        # so the 50.00 quote 28h back is a valid prior; an implementation
+        # anchored on `now` would miss it (4h off) and return 0.0.
+        tmp = tempfile.mkdtemp(prefix="gw_fxanch_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "gold_prices.csv")
+        _write_prices_csv(path, [(_ts(NOW - timedelta(hours=28)), "50.00"),
+                                 (_ts(NOW - timedelta(hours=3)), "50.25")])
+        res = predictor.fx_mean_reversion(path, now=NOW)
+        self.assertEqual(res["score"], -1.0)
+
+    def test_fx_latest_quote_picked_by_timestamp_not_row_order(self):
+        # CSV rows out of chronological order: the LAST row (50.10) is NOT
+        # the newest quote. The score must use the true latest (50.25, NOW):
+        # +0.5% -> -1.0. Using the last row would give +0.2% -> -0.4.
+        tmp = tempfile.mkdtemp(prefix="gw_fxord_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "gold_prices.csv")
+        _write_prices_csv(path, [(_ts(NOW), "50.25"),
+                                 (_ts(NOW - timedelta(hours=24)), "50.00"),
+                                 (_ts(NOW - timedelta(hours=1)), "50.10")])
+        res = predictor.fx_mean_reversion(path, now=NOW)
+        self.assertEqual(res["score"], -1.0)
+
+    # --- bug 3: ladder clamped into [2, 98] ------------------------------ #
+    def test_ladder_clamped_at_extreme_thresholds(self):
+        orig = (predictor.UP_THRESHOLD, predictor.DOWN_THRESHOLD,
+                predictor.LADDER_UP, predictor.LADDER_DOWN)
+        try:
+            predictor.UP_THRESHOLD, predictor.DOWN_THRESHOLD = 70, 30
+            predictor.LADDER_UP = predictor._ladder(
+                70, predictor.LADDER_OFFSETS)
+            predictor.LADDER_DOWN = predictor._ladder(
+                30, tuple(-o for o in predictor.LADDER_OFFSETS))
+            for rungs, rising in ((predictor.LADDER_UP, True),
+                                  (predictor.LADDER_DOWN, False)):
+                self.assertTrue(all(2 <= r <= 98 for r in rungs),
+                                f"rung outside [2,98]: {rungs}")
+                self.assertEqual(len(set(rungs)), len(rungs),
+                                 f"duplicate rungs: {rungs}")
+                gaps = [b - a for a, b in zip(rungs, rungs[1:])]
+                if rising:
+                    self.assertTrue(all(g > 0 for g in gaps))
+                else:
+                    self.assertTrue(all(g < 0 for g in gaps))
+            # unclamped they would be (70,77,84,92,102) and (30,23,16,8,-2)
+            self.assertEqual(predictor.LADDER_UP, (70, 77, 84, 92, 98))
+            self.assertEqual(predictor.LADDER_DOWN, (30, 23, 16, 8, 2))
+        finally:
+            (predictor.UP_THRESHOLD, predictor.DOWN_THRESHOLD,
+             predictor.LADDER_UP, predictor.LADDER_DOWN) = orig
+
+
+# --------------------------------------------------------------------------- #
 # daily_agent rails for the 4th group
 # --------------------------------------------------------------------------- #
 class DailyAgentRailTests(unittest.TestCase):

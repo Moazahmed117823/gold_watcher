@@ -209,8 +209,18 @@ TELEGRAM_DEFAULT_LANG = (os.environ.get("TELEGRAM_LANG", "en").strip().lower()
 # the run it crosses (fresh), guarded by the anti-twitch confirmation rule
 # (LADDER_CONFIRM).
 LADDER_OFFSETS = (0, 7, 14, 22, 32)   # points beyond the FLAT band edge
-LADDER_UP = tuple(UP_THRESHOLD + o for o in LADDER_OFFSETS)     # e.g. 62..94
-LADDER_DOWN = tuple(DOWN_THRESHOLD - o for o in LADDER_OFFSETS)  # e.g. 35..3
+
+
+def _ladder(base, offsets, lo=2, hi=98):
+    """Rungs derived from the band edge, clamped into the gauge's own
+    [2, 98] domain (UP_THRESHOLD=70 must not produce a 102 rung, 30 not a
+    -2 rung) and kept strictly monotonic + unique even after clamping."""
+    return tuple(dict.fromkeys(min(hi, max(lo, base + o)) for o in offsets))
+
+
+LADDER_UP = _ladder(UP_THRESHOLD, LADDER_OFFSETS)               # e.g. 62..94
+LADDER_DOWN = _ladder(DOWN_THRESHOLD,
+                      tuple(-o for o in LADDER_OFFSETS))        # e.g. 35..3
 # Rough by-design meaning of each height (next-day 21K move, %) until your
 # own log has enough samples (>=3) for the measured answer to take over.
 # LADDER_EST_PCT[i] pairs with LADDER_OFFSETS[i] (signed per side).
@@ -282,6 +292,7 @@ def fmt_sign(x):
 FX_MR_MIN_CHG = 0.15     # % 24h USD/EGP move that counts as a real impulse
 FX_MR_SATURATION = 0.5   # % move that saturates the signal at +/-1
 FX_MR_TOL_HOURS = 2.0    # tolerance when locating the quote ~24h ago
+FX_MR_STALE_HOURS = 3.0  # latest quote older than this = dead scraper feed
 
 
 def fx_mean_reversion(csv_path=CSV_PATH, now=None):
@@ -294,7 +305,11 @@ def fx_mean_reversion(csv_path=CSV_PATH, now=None):
     verified-neutral vote, matching the walk-forward).
 
     Strict no look-ahead: only quotes with timestamp <= `now` are read, and
-    the "24h ago" quote is the nearest one within +/-2h of now-24h.
+    the "24h ago" quote is the nearest one within +/-2h of (current quote
+    timestamp - 24h), so the delta is always a true ~24h window.
+    The current quote is the one with the LATEST timestamp (not the last CSV
+    row - row order is not guaranteed). If that quote is more than
+    FX_MR_STALE_HOURS old, the feed is considered stale -> neutral 0.0.
     Fail-soft: missing or stale history -> score 0.0 (never raises).
     """
     result = {"group": "fx_mr", "score": 0.0, "weight": 1.0,
@@ -321,8 +336,13 @@ def fx_mean_reversion(csv_path=CSV_PATH, now=None):
                 quotes.append((ts, fx))
         if not quotes:
             return result
-        cur_ts, cur = quotes[-1]
-        target = now - timedelta(hours=24)
+        cur_ts, cur = max(quotes, key=lambda x: x[0])
+        age_h = (now - cur_ts).total_seconds() / 3600.0
+        if age_h > FX_MR_STALE_HOURS:
+            result["detail"] = (f"stale USD/EGP quote ({age_h:.1f}h old, "
+                                f"scraper stalled?) -> neutral")
+            return result
+        target = cur_ts - timedelta(hours=24)
         prior, best_d = None, None
         for ts, fx in quotes:               # quotes are <= now by construction
             d = abs((ts - target).total_seconds())
@@ -474,7 +494,10 @@ def grade_pending():
         predicted_up = pct > 50.0
         actual = "up" if move_pct > 0.1 else ("down" if move_pct < -0.1 else "flat")
         if actual == "flat":
-            correct = abs(pct - 50.0) < 8.0
+            # A FLAT call means the gauge landed inside the FLAT band; grade
+            # it by the same band the gauge used (not a hardcoded +/-8 window
+            # around 50), so 36..42 and 58..61 also grade correct on flat days.
+            correct = DOWN_THRESHOLD < pct < UP_THRESHOLD
         else:
             correct = (move_pct > 0) == predicted_up
         r[col["price_24h_later"]] = f"{future:.0f}"
