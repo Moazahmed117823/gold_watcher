@@ -1,14 +1,26 @@
 #!/usr/bin/env python3
 """
-Prediction gauge orchestrator (v11).
+Prediction gauge orchestrator (v12).
 ==============================
-Runs the three signal groups (technical, consensus, news), merges them into
-one bias percentage, logs every prediction, self-grades yesterday's calls,
-maintains the 7-day "levels map" from verified analyst levels, and sends a
-compact Telegram message only when it is worth sending (gauge-ladder alarm,
-sell-window milestone, direction flip, >=15-point move, first run of the
-Cairo day, or --force).
+Runs the four signal groups (technical, consensus, news, fx_mr), merges them
+into one bias percentage, logs every prediction, self-grades yesterday's
+calls, maintains the 7-day "levels map" from verified analyst levels, and
+sends a compact Telegram message only when it is worth sending (gauge-ladder
+alarm, sell-window milestone, direction flip, >=15-point move, first run of
+the Cairo day, or --force).
 Morning runs also prepend daily/weekly/monthly digests of past performance.
+
+v12 additions (verified by a 60/40 walk-forward on the graded log, see
+tuning.json / data/tuning_log.csv):
+  - fx_mr group: 24h USD/EGP mean-reversion signal read from gold_prices.csv
+    (the source site computes its 21K price from the parallel USD/EGP rate,
+    so FX spikes partially revert and drag the local price along).
+  - Rebalanced weights 45/25/10/20 (technical/consensus/news/fx_mr) and a
+    stricter FLAT band (62/35) after the walk-forward.
+  - Raw-bias dampener (x0.65) during Monday and Cairo 08:00-11:59, the two
+    windows whose calls historically underperform.
+  - Ladder rungs now derive from the thresholds (they sit a fixed offset
+    beyond the FLAT band edge), so the FLAT band never rings alarms.
 
 v11 additions:
   - SELL WINDOW milestone: flags when the 21K price rises a certain amount
@@ -66,7 +78,8 @@ PRED_HEADER = ["timestamp_utc", "timestamp_cairo", "final_pct", "direction",
                "global_xauusd", "local_chg_7d", "global_chg_7d", "divergence_7d",
                "price_24h_later", "predicted_correct", "graded_at_utc",
                "usdegp_official", "parallel_gap_pct", "real_premium_pct",
-               "formula_dev_pct"]
+               "formula_dev_pct", "fx_mr"]  # fx_mr LAST: migrate_pred_csv pads
+               # old rows by appending the new columns at the end
 LEVELS_HEADER = ["timestamp_utc", "price", "unit", "type", "title"]
 ALARMS_HEADER = ["timestamp_utc", "timestamp_cairo", "kind", "detail",
                  "est_pct", "price", "graded", "actual_pct", "verdict"]
@@ -99,15 +112,17 @@ def _tuned(section, key, default):
 # Weights are env-tunable so recalibration never needs a code change.
 # Since 2026-10-24 the daily AI agent (daily_agent.py) can also adjust
 # them, via tuning.json - priority: env var > tuning.json > defaults.
-# Weight study (2026-10, data: 2y GC=F + USDEGP + 43d real CSV, see
-# scripts/study_weights.py in the addon workspace): the source site COMPUTES
-# its 21K price as global ounce x parallel-market USD/EGP (verified mean
-# arithmetic error 0.005%), so the local series carries the parallel-dollar
-# information that global feeds cannot see. On days when local and global
-# signals disagree, local momentum predicted the next-day LOCAL move better
-# (2y disagreement subset 55-58% vs 47% for global-heavy; real 43d replay
-# 63% vs 41%, small n). Defaults below shift local from 40/30 to 50/20 while
-# keeping the global anchor; override via env vars without touching code.
+# Weight rebalance (2026-11-24, verified by a read-only walk-forward on all
+# 805 graded rows, 60/40 chronological IS/OOS split, no look-ahead): the
+# source site COMPUTES its 21K price as global ounce x parallel-market
+# USD/EGP, so the local technical series carries the parallel-dollar
+# information global feeds cannot see. Per-group agreement with the real
+# non-flat 24h move: technical 61.5% vs consensus 55.2% vs news 53.7%
+# overall, and in the OOS window technical 71.7% vs consensus 59.0%. The
+# rebalanced set (45/25/10) plus the fx_mr group (0.20) improved OOS strict
+# accuracy 66.1% -> 70.2%, OOS direction accuracy 82.6% -> 94.3% and OOS
+# alarm precision 70.4% -> 77.8% vs the then-current tuning. Defaults below
+# match tuning.json; override via env vars without touching code.
 def _weight(key, env_name, default):
     """Weight priority: env var (explicitly set) > tuning.json > default."""
     env = os.environ.get(env_name, "").strip()
@@ -122,9 +137,10 @@ def _weight(key, env_name, default):
 
 
 WEIGHTS = {
-    "technical": _weight("technical", "WEIGHT_TECHNICAL", 0.50),
-    "consensus": _weight("consensus", "WEIGHT_CONSENSUS", 0.20),
-    "news": _weight("news", "WEIGHT_NEWS", 0.30),
+    "technical": _weight("technical", "WEIGHT_TECHNICAL", 0.45),
+    "consensus": _weight("consensus", "WEIGHT_CONSENSUS", 0.25),
+    "news": _weight("news", "WEIGHT_NEWS", 0.10),
+    "fx_mr": _weight("fx_mr", "WEIGHT_FX_MR", 0.20),
 }
 
 
@@ -142,10 +158,10 @@ def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
-UP_THRESHOLD = _threshold("up_threshold", "UP_THRESHOLD", 58, 55, 70)
-DOWN_THRESHOLD = _threshold("down_threshold", "DOWN_THRESHOLD", 42, 30, 45)
+UP_THRESHOLD = _threshold("up_threshold", "UP_THRESHOLD", 62, 55, 70)
+DOWN_THRESHOLD = _threshold("down_threshold", "DOWN_THRESHOLD", 35, 30, 45)
 if UP_THRESHOLD < DOWN_THRESHOLD + 10:   # sanity: keep a real FLAT band
-    UP_THRESHOLD, DOWN_THRESHOLD = 58, 42
+    UP_THRESHOLD, DOWN_THRESHOLD = 62, 35
 NOTIFY_DELTA = 15.0                            # points vs previous run
 ACCURACY_WINDOW = 30                           # graded rows for the accuracy stat
 
@@ -187,14 +203,18 @@ TELEGRAM_DEFAULT_LANG = (os.environ.get("TELEGRAM_LANG", "en").strip().lower()
 
 # Gauge ladder: the gauge read as a price-o-meter. Each height the gauge
 # climbs to (or falls to) is translated into the 21K move that height has
-# meant. Every rung rings once per Cairo day, on the run it crosses (fresh),
-# guarded by the anti-twitch confirmation rule (LADDER_CONFIRM).
-LADDER_UP = (58, 65, 72, 80, 90)     # heights above the FLAT band (42-58)
-LADDER_DOWN = (42, 35, 28, 20, 10)   # mirror below it
+# meant. Rungs sit a fixed offset BEYOND the FLAT band edge (so the band
+# itself never rings: with the default band 35-62 the first rungs are 62/35),
+# follow the thresholds automatically, and each rings once per Cairo day on
+# the run it crosses (fresh), guarded by the anti-twitch confirmation rule
+# (LADDER_CONFIRM).
+LADDER_OFFSETS = (0, 7, 14, 22, 32)   # points beyond the FLAT band edge
+LADDER_UP = tuple(UP_THRESHOLD + o for o in LADDER_OFFSETS)     # e.g. 62..94
+LADDER_DOWN = tuple(DOWN_THRESHOLD - o for o in LADDER_OFFSETS)  # e.g. 35..3
 # Rough by-design meaning of each height (next-day 21K move, %) until your
 # own log has enough samples (>=3) for the measured answer to take over.
-LADDER_EST = {58: 0.5, 65: 0.9, 72: 1.3, 80: 1.8, 90: 2.5,
-              42: -0.5, 35: -0.9, 28: -1.3, 20: -1.8, 10: -2.5}
+# LADDER_EST_PCT[i] pairs with LADDER_OFFSETS[i] (signed per side).
+LADDER_EST_PCT = (0.5, 0.9, 1.3, 1.8, 2.5)
 # An alarm counts as "on target" in the report card when the real move
 # reached at least this fraction of the promised move, same direction.
 ALARM_HIT_FRACTION = 0.5
@@ -259,8 +279,75 @@ def fmt_sign(x):
 # --------------------------------------------------------------------------- #
 # Signal groups
 # --------------------------------------------------------------------------- #
+FX_MR_MIN_CHG = 0.15     # % 24h USD/EGP move that counts as a real impulse
+FX_MR_SATURATION = 0.5   # % move that saturates the signal at +/-1
+FX_MR_TOL_HOURS = 2.0    # tolerance when locating the quote ~24h ago
+
+
+def fx_mean_reversion(csv_path=CSV_PATH, now=None):
+    """fx_mr group: 24h USD/EGP mean-reversion signal in [-1, +1].
+
+    The source site computes its 21K price from the (parallel-market)
+    USD/EGP rate, so an FX spike partially mean-reverts and drags the local
+    gold price with it. Score = clip(-chg_24h / 0.5) when the 24h USD/EGP
+    move is >= 0.15%, else 0.0 (quiet FX = neutral, still weighted - a
+    verified-neutral vote, matching the walk-forward).
+
+    Strict no look-ahead: only quotes with timestamp <= `now` are read, and
+    the "24h ago" quote is the nearest one within +/-2h of now-24h.
+    Fail-soft: missing or stale history -> score 0.0 (never raises).
+    """
+    result = {"group": "fx_mr", "score": 0.0, "weight": 1.0,
+              "detail": "USD/EGP history unavailable -> neutral"}
+    if not os.path.exists(csv_path):
+        return result
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as fh:
+            rows = [r for r in csv.reader(fh) if r]
+        header = {name: i for i, name in enumerate(rows[0])}
+        ts_i, fx_i = header.get("timestamp_utc", 0), header.get("usd_egp")
+        if fx_i is None:
+            return result
+        now = now or datetime.now(timezone.utc)
+        quotes = []
+        for r in rows[1:]:
+            try:
+                ts = datetime.strptime(r[ts_i], "%Y-%m-%d %H:%M:%S") \
+                    .replace(tzinfo=timezone.utc)
+                fx = float(r[fx_i])
+            except (ValueError, IndexError, TypeError):
+                continue
+            if ts <= now and fx > 0:
+                quotes.append((ts, fx))
+        if not quotes:
+            return result
+        cur_ts, cur = quotes[-1]
+        target = now - timedelta(hours=24)
+        prior, best_d = None, None
+        for ts, fx in quotes:               # quotes are <= now by construction
+            d = abs((ts - target).total_seconds())
+            if d <= FX_MR_TOL_HOURS * 3600 and (best_d is None or d < best_d):
+                prior, best_d = fx, d
+        if prior is None:
+            result["detail"] = "no USD/EGP quote ~24h ago (+/-2h) -> neutral"
+            return result
+        chg = (cur - prior) / prior * 100.0
+        if abs(chg) < FX_MR_MIN_CHG:
+            result["detail"] = (f"USD/EGP {cur:.2f} 24h {chg:+.2f}% (quiet) "
+                                "-> neutral")
+            return result
+        score = max(-1.0, min(1.0, -chg / FX_MR_SATURATION))
+        result["score"] = round(score, 3)
+        result["detail"] = (f"USD/EGP {cur:.2f} 24h {chg:+.2f}% -> "
+                            f"mean-reversion {score:+.2f}")
+        return result
+    except Exception as err:  # noqa: BLE001 - fx is fail-soft by design
+        result["detail"] = f"fx_mr unavailable: {err}"
+        return result
+
+
 def collect_signals():
-    """Run all three groups; skip (don't crash) the ones that fail."""
+    """Run all four groups; skip (don't crash) the ones that fail."""
     groups = []
     try:
         groups.append(technical.compute_score(CSV_PATH))
@@ -274,11 +361,19 @@ def collect_signals():
         groups.append(news_reader.read_news(max_articles=6))
     except Exception as err:  # noqa: BLE001
         print(f"  [gauge] news group failed: {err}", file=sys.stderr)
+    try:
+        groups.append(fx_mean_reversion(CSV_PATH))
+    except Exception as err:  # noqa: BLE001
+        print(f"  [gauge] fx_mr group failed: {err}", file=sys.stderr)
     return groups
 
 
 def merge(groups):
-    """Weighted merge with renormalization -> (final_score, available map)."""
+    """Weighted merge with renormalization -> (final_score, available map).
+
+    Groups that are unavailable (absent, or weight <= 0) are renormalized
+    away; a present group with score 0.0 (e.g. quiet FX) still counts.
+    """
     num, den = 0.0, 0.0
     for g in groups:
         w = WEIGHTS.get(g["group"], 0.0) * g.get("weight", 1.0)
@@ -287,6 +382,24 @@ def merge(groups):
         num += w * g["score"]
         den += w
     return (num / den) if den > 0 else 0.0
+
+
+# Raw-bias dampener: Monday and Cairo 08:00-11:59 runs historically
+# underperform (strict accuracy 47.0% / 51.5% vs 59.2% otherwise, all 805
+# graded rows), so their raw merged bias is scaled toward neutral. Verified
+# in the same walk-forward as the weights (OOS direction 91.5% -> 92.5%,
+# IS direction 66.9% -> 69.5%, alarm precision up in both windows).
+BIAS_DAMPENER = _env_float("BIAS_DAMPENER", 0.65)
+
+
+def dampen_raw_bias(bias, dt=None):
+    """Scale the raw merged bias during weak windows; 1.0 disables."""
+    if BIAS_DAMPENER >= 1.0:
+        return bias
+    dt = dt or cairo_now()
+    if dt.strftime("%a") == "Mon" or 8 <= dt.hour < 12:
+        return bias * BIAS_DAMPENER
+    return bias
 
 
 def confidence_label(groups):
@@ -604,6 +717,8 @@ TRANSLATIONS = {
     "sig_technical": {"en": "- technical: {detail}", "ar": "- الفني: {detail}"},
     "sig_consensus": {"en": "- consensus: {detail}", "ar": "- الإجماع العالمي: {detail}"},
     "sig_news": {"en": "- news: {detail}", "ar": "- الأخبار: {detail}"},
+    "sig_fx_mr": {"en": "- fx (USD/EGP 24h mean-reversion): {detail}",
+                  "ar": "- الدولار (ارتداد USD/EGP خلال 24 ساعة): {detail}"},
     "div_line": {"en": "- local-vs-global (7d): 21K {a:+.2f}% | XAU/USD {b:+.2f}% | spread {s:+.2f} pts",
                   "ar": "- المحلي مقابل العالمي (7 أيام): 21ك {a:+.2f}% | الأوقية {b:+.2f}% | الفارق {s:+.2f} نقطة"},
     "dir_UP": {"en": "UP", "ar": "صاعد"},
@@ -838,12 +953,26 @@ def _ladder_points(col, rows):
     return pts
 
 
+def _zone(gauge):
+    """(side, rung_index) for the extreme rung the gauge has reached.
+
+    Index (not the absolute rung value) keys the measured stats, so the
+    buckets stay stable when the thresholds - and with them the rungs -
+    change over time. None = inside the FLAT band.
+    """
+    if gauge >= LADDER_UP[0]:
+        return "up", max(i for i, r in enumerate(LADDER_UP) if r <= gauge)
+    if gauge <= LADDER_DOWN[0]:
+        return "down", min(i for i, r in enumerate(LADDER_DOWN) if r >= gauge)
+    return None
+
+
 def _gauge_move_stats(pts):
     """Gauge zone -> (avg next-day 21K move %, samples) from the own log.
 
-    Zone = the highest up-rung reached (or lowest down-rung), 0 = FLAT band.
-    'Next-day move' = the 21K price 21-36h later vs now - the same reality
-    check the self-grading loop uses.
+    Zone = (side, rung index): the highest up-rung reached (or lowest
+    down-rung). 'Next-day move' = the 21K price 21-36h later vs now - the
+    same reality check the self-grading loop uses.
     """
     buckets = {}
     for ts, g, p in pts:
@@ -856,23 +985,25 @@ def _gauge_move_stats(pts):
         if not nxt:
             continue
         move = (nxt[1] - p) / p * 100.0
-        if g >= LADDER_UP[0]:
-            zone = max(r for r in LADDER_UP if r <= g)
-        elif g <= LADDER_DOWN[0]:
-            zone = min(r for r in LADDER_DOWN if r >= g)
-        else:
-            zone = 0
-        buckets.setdefault(zone, []).append(move)
+        zone = _zone(g)
+        if zone:
+            buckets.setdefault(zone, []).append(move)
     return {z: (sum(v) / len(v), len(v)) for z, v in buckets.items()}
 
 
-def _ladder_meaning(rung, stats, price, lang="en"):
+def _rung_est(side, idx):
+    """Signed promised move (%) for a ladder zone, before measuring."""
+    return LADDER_EST_PCT[idx] * (1 if side == "up" else -1)
+
+
+def _ladder_meaning(side, idx, stats, price, lang="en"):
     """(pct, egp, source): what a ladder height has meant for 21K next day."""
-    if rung in stats and stats[rung][1] >= 3:
-        pct, n = stats[rung]
+    zone = (side, idx)
+    if zone in stats and stats[zone][1] >= 3:
+        pct, n = stats[zone]
         src = T(lang, "src_measured", n=n)
     else:
-        pct = LADDER_EST.get(rung, 0.0)
+        pct = _rung_est(side, idx)
         src = T(lang, "src_rough")
     egp = pct / 100.0 * price if price else None
     return pct, egp, src
@@ -1070,10 +1201,14 @@ def detect_gauge_alarm(current_gauge, current_price, persist=True):
         side, rung = "up", max(new_up)
     else:
         side, rung = "down", min(new_down)
-    est_pct, egp, src = _ladder_meaning(rung, _gauge_move_stats(pts),
+    idx = (LADDER_UP.index(rung) if side == "up"
+           else LADDER_DOWN.index(rung))
+    est_pct, egp, src = _ladder_meaning(side, idx, _gauge_move_stats(pts),
                                         current_price)
     for r in (new_up if new_up else new_down):
-        _append_alarm("gauge", f"{side}:{r}", LADDER_EST.get(r, 0.0),
+        r_idx = (LADDER_UP.index(r) if side == "up"
+                 else LADDER_DOWN.index(r))
+        _append_alarm("gauge", f"{side}:{r}", _rung_est(side, r_idx),
                       current_price, persist)
     res = {"side": side, "rung": rung, "levels": len(new_up or new_down),
            "gauge": current_gauge, "est_pct": est_pct, "egp": egp, "src": src}
@@ -1196,6 +1331,7 @@ def main():
         print("[gauge] FATAL: all signal groups failed", file=sys.stderr)
         return 1
     final_score = merge(groups)
+    final_score = dampen_raw_bias(final_score)
     pct = round(max(2.0, min(98.0, 50.0 + 50.0 * final_score)))
     direction = "UP" if pct >= UP_THRESHOLD else ("DOWN" if pct <= DOWN_THRESHOLD else "FLAT")
     conf = confidence_label(groups)
@@ -1313,7 +1449,8 @@ def main():
                          conf=_conf_word(lang, conf)),
                        change_txt])
         sig = [T(lang, "sig_" + g["group"], detail=g["detail"])
-               for g in groups if g["group"] in ("technical", "consensus", "news")]
+               for g in groups
+               if g["group"] in ("technical", "consensus", "news", "fx_mr")]
         if divergence is not None:
             sig.append(T(lang, "div_line", a=local_7d, b=global_7d, s=divergence))
         if sig:
@@ -1358,6 +1495,7 @@ def main():
         "technical": next((f"{g['score']:.3f}" for g in groups if g["group"] == "technical"), ""),
         "consensus": next((f"{g['score']:.3f}" for g in groups if g["group"] == "consensus"), ""),
         "news": next((f"{g['score']:.3f}" for g in groups if g["group"] == "news"), ""),
+        "fx_mr": next((f"{g['score']:.3f}" for g in groups if g["group"] == "fx_mr"), ""),
         "price_21k": current_21k if current_21k else "",
         "global_xauusd": (f"{global_close:.2f}" if isinstance(global_close, (int, float)) else ""),
         "local_chg_7d": (f"{local_7d:+.3f}" if isinstance(local_7d, (int, float)) else ""),

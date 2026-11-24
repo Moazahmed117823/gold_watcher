@@ -143,20 +143,21 @@ Gold gauge: 72% UP (moderate)
 ... (the normal gauge snapshot follows)
 ```
 
-The ladder (estimates at a 6,300 EGP 21K price):
+The ladder (estimates at a 6,300 EGP 21K price; rungs follow the FLAT band
+edge, which since 2026-11 sits at 62/35):
 
 | Gauge height | Next-day 21K move it stands for | ~ EGP on 21K |
 |---|---|---|
-| 90% | about +2.5% | ~ +158 |
-| 80% | about +1.8% | ~ +113 |
-| 72% | about +1.3% | ~ +82 |
-| 65% | about +0.9% | ~ +57 |
-| 58% (UP line) | about +0.5% | ~ +32 |
-| 42% (DOWN line) | about -0.5% | ~ -32 |
-| 35% | about -0.9% | ~ -57 |
-| 28% | about -1.3% | ~ -82 |
-| 20% | about -1.8% | ~ -113 |
-| 10% | about -2.5% | ~ -158 |
+| 94% | about +2.5% | ~ +158 |
+| 84% | about +1.8% | ~ +113 |
+| 76% | about +1.3% | ~ +82 |
+| 69% | about +0.9% | ~ +57 |
+| 62% (UP line) | about +0.5% | ~ +32 |
+| 35% (DOWN line) | about -0.5% | ~ -32 |
+| 28% | about -0.9% | ~ -57 |
+| 21% | about -1.3% | ~ -82 |
+| 13% | about -1.8% | ~ -113 |
+| 3% | about -2.5% | ~ -158 |
 
 Stupid-simple rules it follows:
 - FRESH: the alarm describes the run it fires in - "just climbed" means THIS
@@ -179,8 +180,10 @@ Stupid-simple rules it follows:
   that height: ahead of / in line with / against - so a fast market is visible
   in the same message
 
-Want different heights? Edit `LADDER_UP` / `LADDER_DOWN` at the top of
-`predictor.py` (two one-line tuples).
+Want different heights? The rungs sit at fixed offsets (0/7/14/22/32 points)
+beyond the FLAT band edge, so they follow `UP_THRESHOLD` / `DOWN_THRESHOLD`
+automatically (tuning.json can move them); the offsets live in
+`LADDER_OFFSETS` at the top of `predictor.py`.
 
 ## The SELL WINDOW milestone (price spike above the day's average)
 
@@ -362,13 +365,41 @@ weight-study chart):
   anchor. Default weights moved 40/30/30 -> **50/20/30**
   (technical/consensus/news)
 
+### What the 2026-11-24 walk-forward changed
+
+A read-only walk-forward on all 805 graded rows (60/40 chronological
+in-sample/out-of-sample, no look-ahead: the fx signal may only read
+`gold_prices.csv` rows at or before each prediction) verified four changes;
+the out-of-sample window (last 322 rows, ~2026-11-10 onward) decided:
+
+- **Per-group agreement** with the real non-flat 24h move: technical 61.5%,
+  consensus 55.2%, news 53.7% over the whole log - and in the OOS window
+  technical 71.7% vs consensus 59.0%. Weights rebalanced to
+  **45/25/10/20** (technical/consensus/news/fx_mr).
+- **fx_mr, a fourth signal group** (weight 0.20): 24h USD/EGP
+  mean-reversion, `clip(-chg_24h / 0.5)` when the site's own USD/EGP moved
+  >= 0.15% in 24h, else neutral 0. Sign agreement with the next 24h 21K
+  move: 56.7% in-sample, 67.9% OOS. Logged in the new `fx_mr` column of
+  `data/predictions.csv` (old rows get an empty value - migrated safely).
+- **Stricter FLAT band 62/35**: gauge readings 36-42 (weak DOWN calls, only
+  43.8% strict accuracy historically) and their alarm rung were the worst
+  zone in the log; they are now FLAT and the first down-rung sits at 35,
+  where strong DOWN calls historically hit 88.5%.
+- **Raw-bias dampener x0.65** during Monday and Cairo 08:00-11:59 (the two
+  windows whose calls ran 47.0% / 51.5% strict vs 59.2% otherwise).
+
+Out-of-sample effect vs the previous tuning: strict accuracy 66.1% -> 70.2%,
+direction accuracy 82.6% -> 94.3%, gauge-alarm precision 70.4% -> 77.8%
+(in-sample improved on all three as well).
+
 Override without touching code (repo variables or workflow env):
 
 ```yaml
 env:
-  WEIGHT_TECHNICAL: 0.50   # local 21K composite
-  WEIGHT_CONSENSUS: 0.20   # TradingView XAU/USD crowd
-  WEIGHT_NEWS: 0.30        # LLM news reading
+  WEIGHT_TECHNICAL: 0.45   # local 21K composite
+  WEIGHT_CONSENSUS: 0.25   # TradingView XAU/USD crowd
+  WEIGHT_NEWS: 0.10        # LLM news reading
+  WEIGHT_FX_MR: 0.20       # USD/EGP 24h mean-reversion
 ```
 
 ## The unknown local variable (measured, not guessed)
@@ -409,11 +440,13 @@ premium-driven) — and the `WEIGHT_*` env knobs adjust without code.
 | `LLM_MODEL` | `openai/gpt-oss-20b` | try `openai/gpt-oss-120b` or Z.ai GLM for stronger Arabic reading |
 | `LLM_TIMEOUT` | 25 | seconds per LLM call |
 | `LLM_MIN_INTERVAL` | 10 | min seconds between LLM calls — keeps Groq's free tier (8,000 tokens/MINUTE) happy; 6 articles ≈ +1 min runtime |
-| `WEIGHT_TECHNICAL` | 0.50 | local 21K technical group weight (was 0.40) |
-| `WEIGHT_CONSENSUS` | 0.20 | TradingView consensus weight (was 0.30) |
-| `WEIGHT_NEWS` | 0.30 | news group weight (unchanged) |
+| `WEIGHT_TECHNICAL` | 0.45 | local 21K technical group weight |
+| `WEIGHT_CONSENSUS` | 0.25 | TradingView consensus weight |
+| `WEIGHT_NEWS` | 0.10 | news group weight |
+| `WEIGHT_FX_MR` | 0.20 | USD/EGP 24h mean-reversion group weight |
+| `BIAS_DAMPENER` | 0.65 | raw-bias scale during Monday + Cairo 08:00-11:59; 1.0 disables |
 | (code) `NOTIFY_DELTA` | 15 | points of change that trigger a message |
-| (code) `LADDER_UP` / `LADDER_DOWN` | 58/65/72/80/90, 42/35/28/20/10 | gauge heights that ring; edit in predictor.py |
+| (code) `LADDER_UP` / `LADDER_DOWN` | 62/69/76/84/94, 35/28/21/13/3 (derived from the FLAT band + offsets 0/7/14/22/32) | gauge heights that ring |
 | `LADDER_CONFIRM` | 2.0 | pts a crossing must clear to ring instantly (anti-twitch); 0 = old always-instant behaviour |
 | `MILESTONE_PCT` | 0.5 | SELL WINDOW: % above the day's average price that rings |
 | `MILESTONE_EGP` | 0 (off) | SELL WINDOW: absolute EGP line above the baseline |

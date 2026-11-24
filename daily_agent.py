@@ -21,11 +21,12 @@ DECIDES what, if anything, to change to improve accuracy:
                 decision: analysis (EN+AR), a small set of changes,
                 and a ready-to-send Telegram report (EN+AR).
   3. RAILS    - the runner validates everything and clamps:
-                weights [0.10..0.60] renormalized to 1.0, max move
-                0.10/group/day; ladder_confirm [0..6]; milestone_pct
-                [0.3..1.0]; up_threshold [55..70] / down_threshold
-                [30..45] with up >= down + 10; max 3 changes; nothing
-                at all when graded calls < 15.
+                weights per group (technical/consensus/news
+                [0.10..0.60], fx_mr [0.05..0.35]) renormalized to 1.0,
+                max move 0.10/group/day; ladder_confirm [0..6];
+                milestone_pct [0.3..1.0]; up_threshold [55..70] /
+                down_threshold [30..45] with up >= down + 10; max 3
+                changes; nothing at all when graded calls < 15.
   3b. CODE PATCH - if the agent sees concrete evidence of a CODE or DATA
                 bug (broken scraper source, wrong grading, malformed rows,
                 logic error) it may request to inspect an allowlisted file,
@@ -78,21 +79,26 @@ TUNING_LOG_PATH = os.path.join(DATA_DIR, "tuning_log.csv")
 
 TUNING_LOG_HEADER = ["date_utc", "n_graded", "before", "after",
                      "changes", "analysis"]
-GROUPS = ("technical", "consensus", "news")
+GROUPS = ("technical", "consensus", "news", "fx_mr")
 ACC_WINDOW = 30
 MOVE_DEAD = 0.10       # |24h move %| below this = flat -> excluded
 SCORE_DEAD = 0.05      # |group score| below this = neutral -> excluded
 
 # ---- safety rails --------------------------------------------------------- #
 W_MIN, W_MAX = 0.10, 0.60
+# Per-group weight bounds: fx_mr is a newer, thinner signal - it may sit
+# lower (0.05) but must not dominate (0.35). Groups not listed use W_MIN/W_MAX.
+GROUP_BOUNDS = {"technical": (0.10, 0.60), "consensus": (0.10, 0.60),
+                "news": (0.10, 0.60), "fx_mr": (0.05, 0.35)}
 W_MAX_MOVE = 0.10      # max weight change per group per day
 KNOB_RANGES = {"ladder_confirm": (0.0, 6.0), "milestone_pct": (0.3, 1.0)}
 THRESH_RANGES = {"up_threshold": (55.0, 70.0), "down_threshold": (30.0, 45.0)}
 MAX_CHANGES = 3
 MIN_GRADED_FOR_CHANGES = 15
-DEFAULT_WEIGHTS = {"technical": 0.50, "consensus": 0.20, "news": 0.30}
+DEFAULT_WEIGHTS = {"technical": 0.45, "consensus": 0.25, "news": 0.10,
+                   "fx_mr": 0.20}
 DEFAULT_KNOBS = {"ladder_confirm": 2.0, "milestone_pct": 0.5}
-DEFAULT_THRESHOLDS = {"up_threshold": 58, "down_threshold": 42}
+DEFAULT_THRESHOLDS = {"up_threshold": 62, "down_threshold": 35}
 
 # ---- code-patch rails ----------------------------------------------------- #
 ALLOW_CODE_PATCH = os.environ.get("ALLOW_CODE_PATCH", "1") not in (
@@ -124,9 +130,10 @@ SYS_PROMPT = (
     "found, what you changed and why (or why nothing changed).\n"
     "\n"
     "WHAT YOU MAY CHANGE (the runner clamps everything):\n"
-    '- {"type": "weight", "group": "technical|consensus|news", "value": x} '
-    "- each lands in [0.10..0.60], renormalized to sum 1.0; max move 0.10 "
-    "per group per day.\n"
+    '- {"type": "weight", "group": "technical|consensus|news|fx_mr", '
+    '"value": x} - each group has its own bounds: technical/consensus/news '
+    "in [0.10..0.60], fx_mr in [0.05..0.35]; renormalized to sum 1.0; max "
+    "move 0.10 per group per day.\n"
     '- {"type": "knob", "name": "ladder_confirm", "value": x} in [0..6] - '
     "anti-twitch confirm points: raise if alarms keep missing, lower only "
     "if alarms earn trust.\n"
@@ -134,8 +141,9 @@ SYS_PROMPT = (
     "- sell-window sensitivity above the day's average price.\n"
     '- {"type": "threshold", "name": "up_threshold"|"down_threshold", '
     '"value": x} in [55..70]/[30..45] with up >= down + 10 - the FLAT band; '
-    "HIGH-IMPACT: changes how often the gauge commits to a direction, "
-    "change rarely and at most 2 points per day.\n"
+    "HIGH-IMPACT: changes how often the gauge commits to a direction AND "
+    "where the alarm ladder rungs sit (they follow the band edge), change "
+    "rarely and at most 2 points per day.\n"
     "\n"
     "HARD RULES (enforced by the runner anyway):\n"
     "- If graded calls < 15 you may NOT change anything - report only.\n"
@@ -144,9 +152,15 @@ SYS_PROMPT = (
     "second; strict includes the landing window, so treat it as the harsh "
     "lens.\n"
     "- The technical group reads LOCAL 21K EGP prices and carries the "
-    "parallel-dollar signal; a 5-year study set 50/20/30. A sudden drop in "
-    "technical agreement can mean a market REGIME change, not a bad signal "
-    "- prefer slow moves and say so in the report.\n"
+    "parallel-dollar signal; the fx_mr group reads the site's own USD/EGP "
+    "24h change (negative after an EGP spike = mean-reversion; neutral 0 "
+    "when FX is quiet). A 2026-11 walk-forward set the baseline 45/25/10/20 "
+    "(technical/consensus/news/fx_mr) with a 62/35 FLAT band. A sudden drop "
+    "in technical agreement can mean a market REGIME change, not a bad "
+    "signal - prefer slow moves and say so in the report.\n"
+    "- fx_mr agreement is regime-sensitive (it was a coin flip over the "
+    "full log but 68% in the recent window); judge it on the recent 60 "
+    "graded rows, not the all-time number.\n"
     "- Do not flip-flop: check tuning_history; undo yesterday's move only "
     "with fresh evidence.\n"
     "\n"
@@ -390,8 +404,8 @@ def recent_rows_section(k=8):
     for r in graded:
         out.append({c: r.get(c) for c in
                     ("timestamp_utc", "final_pct", "direction", "technical",
-                     "consensus", "news", "price_21k", "price_24h_later",
-                     "predicted_correct")})
+                     "consensus", "news", "fx_mr", "price_21k",
+                     "price_24h_later", "predicted_correct")})
     return out
 
 
@@ -613,7 +627,8 @@ def validate_changes(decisions, digest, weights, knobs, thresholds):
                 if g not in GROUPS:
                     notes.append(f"dropped weight change: unknown group {g!r}")
                     continue
-                v = _clamp(float(c["value"]), W_MIN, W_MAX)
+                lo, hi = GROUP_BOUNDS.get(g, (W_MIN, W_MAX))
+                v = _clamp(float(c["value"]), lo, hi)
                 v = _clamp(v, weights[g] - W_MAX_MOVE, weights[g] + W_MAX_MOVE)
                 applied.append({"type": "weight", "group": g,
                                 "from": round(weights[g], 3), "to": round(v, 3)})
