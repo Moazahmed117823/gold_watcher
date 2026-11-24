@@ -510,7 +510,6 @@ _last_llm_ts = 0.0
 
 def _llm_gap(min_gap=4.0):
     """Space consecutive LLM calls so burst limits are not hit."""
-    global _last_llm_ts
     wait = min_gap - (time.time() - _last_llm_ts)
     if wait > 0:
         time.sleep(wait)
@@ -878,7 +877,7 @@ def apply_code_patch(blocks, known_hosts):
         for rel in sorted(patched):
             r = subprocess.run(
                 [sys.executable, "-m", "py_compile", _repo_file(rel)],
-                capture_output=True, timeout=60)
+                capture_output=True, timeout=60, check=False)
             if r.returncode != 0:
                 raise RuntimeError("py_compile failed for "
                                    f"{rel}: {r.stderr.decode()[-300:]}")
@@ -887,7 +886,7 @@ def apply_code_patch(blocks, known_hosts):
             r = subprocess.run(
                 [sys.executable, "-c",
                  f"import importlib; importlib.import_module({mod!r})"],
-                cwd=BASE_DIR, capture_output=True, timeout=90)
+                cwd=BASE_DIR, capture_output=True, timeout=90, check=False)
             if r.returncode != 0:
                 raise RuntimeError(f"import test failed for {mod}: "
                                    f"{r.stderr.decode()[-300:]}")
@@ -908,18 +907,20 @@ def commit_code_patch(files, why):
                    ".github.com"]
     for _ in range(3):
         subprocess.run(["git", "pull", "--rebase", "--autostash",
-                        "origin", "main"], cwd=BASE_DIR, capture_output=True)
+                        "origin", "main"], cwd=BASE_DIR, capture_output=True,
+                       check=False)
         subprocess.run(["git", "add", *files], cwd=BASE_DIR,
-                       capture_output=True)
+                       capture_output=True, check=False)
         rc = subprocess.run(["git", *idcfg, "commit", "-m", msg],
-                            cwd=BASE_DIR, capture_output=True)
+                            cwd=BASE_DIR, capture_output=True, check=False)
         if rc.returncode != 0:
             return False, "nothing committed (" + \
                 rc.stdout.decode()[-100:].strip() + ")", ""
         if subprocess.run(["git", "push", "origin", "main"], cwd=BASE_DIR,
-                          capture_output=True).returncode == 0:
+                          capture_output=True, check=False).returncode == 0:
             h = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
-                               cwd=BASE_DIR, capture_output=True)
+                               cwd=BASE_DIR, capture_output=True,
+                               check=False)
             return True, "committed + pushed", h.stdout.decode().strip()
         time.sleep(8)
     return False, "push failed after retries (commit kept local)", ""

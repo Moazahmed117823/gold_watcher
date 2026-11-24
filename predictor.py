@@ -254,7 +254,7 @@ def read_last_row(path):
         rows = [r for r in csv.reader(fh) if r]
     if len(rows) < 2:
         return None
-    return dict(zip(rows[0], rows[-1]))
+    return dict(zip(rows[0], rows[-1], strict=False))
 
 
 def append_row(path, header, row):
@@ -986,7 +986,7 @@ def _zone(gauge):
     if gauge >= LADDER_UP[0]:
         return "up", max(i for i, r in enumerate(LADDER_UP) if r <= gauge)
     if gauge <= LADDER_DOWN[0]:
-        return "down", min(i for i, r in enumerate(LADDER_DOWN) if r >= gauge)
+        return "down", max(i for i, r in enumerate(LADDER_DOWN) if r >= gauge)
     return None
 
 

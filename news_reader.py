@@ -69,6 +69,13 @@ def fetch_rss(url, timeout=15):
     """Minimal RSS 2.0 parser (stdlib ET). Returns list of item dicts."""
     resp = requests.get(url, headers=HEADERS, timeout=timeout)
     resp.raise_for_status()
+    # Entity-expansion guard: XML feeds are untrusted, and a DTD with
+    # <!ENTITY> (billion-laughs / XXE) can blow up the parser or read local
+    # files. RSS never needs a DTD - reject any feed that declares one.
+    upper = resp.content.upper()
+    if b"<!DOCTYPE" in upper or b"<!ENTITY" in upper:
+        raise ValueError("feed declares DOCTYPE/ENTITY - rejected by the "
+                         "XML entity-expansion guard")
     root = ET.fromstring(resp.content)
     items = []
     for item in root.iter("item"):

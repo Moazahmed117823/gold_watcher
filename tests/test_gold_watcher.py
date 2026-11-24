@@ -446,6 +446,90 @@ class V12BugfixRegressionTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# _zone rung mapping + RSS XML entity-expansion guard
+# --------------------------------------------------------------------------- #
+class ZoneMappingTests(unittest.TestCase):
+    """_zone() must map every rung to its own distinct index. The down side
+    used to collapse every rung into ('down', 0) via min()."""
+
+    def test_up_rungs_map_to_distinct_indices(self):
+        for i, rung in enumerate(predictor.LADDER_UP):
+            self.assertEqual(predictor._zone(rung), ("up", i),
+                             f"up rung {rung} must map to index {i}")
+
+    def test_down_rungs_map_to_distinct_indices(self):
+        for i, rung in enumerate(predictor.LADDER_DOWN):
+            self.assertEqual(predictor._zone(rung), ("down", i),
+                             f"down rung {rung} must map to index {i}")
+        # explicit regression: (35, 28, 21, 13, 3) used to give ('down', 0)
+        # for every rung except via the buggy min() collapsing all to 0
+        self.assertEqual(predictor._zone(28), ("down", 1))
+        self.assertEqual(predictor._zone(21), ("down", 2))
+
+    def test_extremes_and_flat_band(self):
+        self.assertEqual(predictor._zone(98),
+                         ("up", len(predictor.LADDER_UP) - 1))
+        self.assertEqual(predictor._zone(2),
+                         ("down", len(predictor.LADDER_DOWN) - 1))
+        mid = (predictor.UP_THRESHOLD + predictor.DOWN_THRESHOLD) // 2
+        self.assertIsNone(predictor._zone(mid))       # inside the FLAT band
+        self.assertIsNone(predictor._zone(50))
+
+
+class RssXmlGuardTests(unittest.TestCase):
+    """fetch_rss must reject feeds declaring DOCTYPE/ENTITY (XXE /
+    billion-laughs), and collect_headlines must survive such a feed."""
+
+    HOSTILE = (b'<?xml version="1.0"?>\n'
+               b'<!DOCTYPE rss [<!ENTITY xxe SYSTEM "file:///etc/passwd">'
+               b'<!ENTITY a "boom">]>\n'
+               b'<rss><channel><item><title>&xxe;</title>'
+               b'<link>https://x.example/a</link></item></channel></rss>')
+    CLEAN = (b'<?xml version="1.0"?>\n'
+             b'<rss><channel><item><title>Gold up 1%</title>'
+             b'<link>https://x.example/b</link>'
+             b'<description>bullion rally</description>'
+             b'</item></channel></rss>')
+
+    class _FakeResp:
+        def __init__(self, content):
+            self.content = content
+
+        def raise_for_status(self):
+            pass
+
+    def setUp(self):
+        import news_reader
+        self.nr = news_reader
+        self._orig_get = news_reader.requests.get
+
+    def tearDown(self):
+        self.nr.requests.get = self._orig_get
+
+    def _serve(self, payload):
+        self.nr.requests.get = (lambda *a, **k: self._FakeResp(payload))
+
+    def test_guard_rejects_doctype_entity(self):
+        self._serve(self.HOSTILE)
+        with self.assertRaises(ValueError) as cm:
+            self.nr.fetch_rss("https://rss.example/feed")
+        self.assertIn("DOCTYPE/ENTITY", str(cm.exception))
+        # the failure must not leak the entity target into the error text
+        self.assertNotIn("file://", str(cm.exception))
+
+    def test_clean_feed_still_parses(self):
+        self._serve(self.CLEAN)
+        items = self.nr.fetch_rss("https://rss.example/feed")
+        self.assertEqual([it["title"] for it in items], ["Gold up 1%"])
+
+    def test_collect_headlines_tolerates_hostile_feed(self):
+        # every feed "returns" the hostile payload -> each feed fails softly,
+        # the run must survive with zero headlines (never crash)
+        self._serve(self.HOSTILE)
+        self.assertEqual(self.nr.collect_headlines(), [])
+
+
+# --------------------------------------------------------------------------- #
 # daily_agent rails for the 4th group
 # --------------------------------------------------------------------------- #
 class DailyAgentRailTests(unittest.TestCase):

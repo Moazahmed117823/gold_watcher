@@ -213,7 +213,7 @@ def read_last_row(path):
         rows = [r for r in csv.reader(fh) if r]
         if len(rows) < 2:
             return None
-        return dict(zip(CSV_HEADER, rows[-1]))
+        return dict(zip(CSV_HEADER, rows[-1], strict=False))
 
 
 def append_row(path, row):

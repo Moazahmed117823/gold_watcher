@@ -90,7 +90,7 @@ def _last_row(path):
         rows = [r for r in csv.reader(fh) if r]
     if len(rows) < 2:
         return None
-    return dict(zip(rows[0], rows[-1]))
+    return dict(zip(rows[0], rows[-1], strict=False))
 
 
 _FX_CACHE = {"t": 0.0, "v": None}
