@@ -1,10 +1,10 @@
 {
-  "updated_utc": "2026-11-24 17:40:00",
+  "updated_utc": "2026-11-25 03:56:56",
   "weights": {
-    "technical": 0.45,
-    "consensus": 0.25,
-    "news": 0.1,
-    "fx_mr": 0.2
+    "technical": 0.526,
+    "consensus": 0.211,
+    "news": 0.105,
+    "fx_mr": 0.158
   },
   "knobs": {
     "ladder_confirm": 2.0,
@@ -14,5 +14,5 @@
     "up_threshold": 62.0,
     "down_threshold": 35.0
   },
-  "last_change_reason": "Read-only 60/40 walk-forward on all 805 graded rows (no look-ahead): per-group agreement technical 61.5% / consensus 55.2% / news 53.7% overall and technical 71.7% vs consensus 59.0% OOS -> rebalance to 45/25/10. Added fx_mr (24h USD/EGP mean-reversion, 67.9% OOS sign agreement) at 0.20. Stricter FLAT band 62/35 keeps the weak [36-42] down zone (43.8% strict accuracy) out of calls and alarms. Dampener x0.65 on Monday + Cairo 08:00-11:59 raw bias. OOS: strict 66.1% -> 70.2%, direction 82.6% -> 94.3%, alarm precision 70.4% -> 77.8%. In-sample improved on all three as well."
+  "last_change_reason": "Recent accuracy 65% (dir) but technical agreement only 54% while consensus 79%. Current weights over‑emphasize consensus and fx (no data)."
 }
