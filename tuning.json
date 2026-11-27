@@ -1,10 +1,10 @@
 {
-  "updated_utc": "2026-11-26 03:22:52",
+  "updated_utc": "2026-11-27 03:29:37",
   "weights": {
-    "technical": 0.615,
-    "consensus": 0.217,
-    "news": 0.108,
-    "fx_mr": 0.06
+    "technical": 0.52,
+    "consensus": 0.32,
+    "news": 0.109,
+    "fx_mr": 0.051
   },
   "knobs": {
     "ladder_confirm": 2.0,
@@ -14,5 +14,5 @@
     "up_threshold": 62.0,
     "down_threshold": 35.0
   },
-  "last_change_reason": "Recent 30‑row accuracy 30% and technical agreement 44% show a regime shift; fx_mr agreement 0% and weight 0.158 hurt direction hits. Reducing fx_mr to 0.05 and boosting technical to 0.60 aligns weights with agreement."
+  "last_change_reason": "Recent 60‑row agreement: technical 4%, consensus 55%, news 16%, fx 0%. Current weights over‑emphasize technical (0.615) and under‑weight consensus (0.217). Reduce technical by 0.10, increase consensus by 0.10, lower fx to 0.05."
 }
